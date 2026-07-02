@@ -16,14 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
-            artifact_name: ai-gateway-macos-x64
-            executable_name: ai-gateway
-            archive_name: ai-gateway-macos-x64.zip
           - os: macos-14
-            artifact_name: ai-gateway-macos-arm64
+            artifact_name: ai-gateway-macos
             executable_name: ai-gateway
-            archive_name: ai-gateway-macos-arm64.zip
+            archive_name: ai-gateway-macos.zip
           - os: windows-latest
             artifact_name: ai-gateway-windows-x64
             executable_name: ai-gateway.exe
