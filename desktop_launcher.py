@@ -3,6 +3,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import uvicorn
@@ -43,11 +44,22 @@ def setup_environment() -> None:
     os.environ.setdefault("MAX_CAPTURE_BYTES", "0")
 
 
+def log_launcher_error(error: BaseException) -> None:
+    try:
+        log_path = runtime_data_dir() / "launcher-error.log"
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write(traceback.format_exc())
+            file.write("\n")
+    except Exception:
+        pass
+
+
 class GatewayApi:
     def __init__(self, host: str = "127.0.0.1") -> None:
         self.host = host
         self.server: uvicorn.Server | None = None
         self.port: int | None = None
+        self.window = None
 
     def start_gateway(self, raw_port: str) -> dict:
         try:
@@ -72,7 +84,16 @@ class GatewayApi:
         if not wait_for_server(self.host, port):
             return {"ok": False, "error": "服务启动超时，请重试。"}
 
-        return {"ok": True, "url": f"http://{self.host}:{port}/"}
+        url = f"http://{self.host}:{port}/"
+        if self.window is not None:
+            def load_dashboard() -> None:
+                try:
+                    self.window.load_url(url)
+                except Exception as exc:
+                    log_launcher_error(exc)
+
+            threading.Timer(0.2, load_dashboard).start()
+        return {"ok": True, "url": url}
 
     def stop_gateway(self) -> None:
         if self.server is not None:
@@ -188,7 +209,7 @@ def start_page() -> str:
       try {{
         const result = await window.pywebview.api.start_gateway(port.value);
         if (result.ok) {{
-          window.location.href = result.url;
+          error.textContent = '正在打开控制台...';
           return;
         }}
         error.textContent = result.error || '启动失败，请重试。';
@@ -221,6 +242,7 @@ def main() -> None:
         height=860,
         min_size=(920, 640),
     )
+    api.window = window
 
     def on_closed() -> None:
         api.stop_gateway()
