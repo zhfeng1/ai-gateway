@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
-  <string>zh_CN</string>
+  <string>zh-Hans</string>
   <key>CFBundleDisplayName</key>
-  <string>AI Gateway</string>
+  <string>AI 网关</string>
   <key>CFBundleExecutable</key>
   <string>AI Gateway</string>
   <key>CFBundleIdentifier</key>
@@ -15,9 +15,14 @@
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>AI Gateway</string>
+  <string>AI 网关</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>zh-Hans</string>
+    <string>en</string>
+  </array>
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
   <key>CFBundleVersion</key>

@@ -88,6 +88,7 @@ jobs:
             "macos/AI Gateway/App.swift"
           cp -R "dist/ai-gateway-backend/." "$APP_DIR/Contents/Resources/backend/"
           cp "macos/AI Gateway/Info.plist" "$APP_DIR/Contents/Info.plist"
+          cp -R "macos/AI Gateway/"*.lproj "$APP_DIR/Contents/Resources/"
           VERSION="${GITHUB_REF_NAME#v}"
           if [[ ! "$VERSION" =~ ^[0-9]+([.][0-9]+){0,2}$ ]]; then
             VERSION="0.1.0"

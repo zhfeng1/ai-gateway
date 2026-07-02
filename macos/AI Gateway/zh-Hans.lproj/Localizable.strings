@@ -1,0 +1,11 @@
+"app.name" = "AI 网关";
+"start.subtitle" = "选择本地端口后，将在此窗口内打开网关控制台。";
+"start.port" = "启动端口";
+"start.button" = "启动";
+"status.starting" = "启动中...";
+"error.invalidPort" = "请输入有效的数字端口。";
+"error.portInUse" = "端口 %d 已被占用，请换一个端口。";
+"error.startFailed" = "启动失败：%@";
+"error.startTimeout" = "服务启动超时，请重试。";
+"error.missingResources" = "找不到应用资源目录。";
+"error.missingBackend" = "找不到内置网关服务。";

@@ -3,6 +3,10 @@ import WebKit
 
 private let defaultPort = "20000"
 
+private func tr(_ key: String) -> String {
+    NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
+}
+
 final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -31,7 +35,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
             backing: .buffered,
             defer: false
         )
-        window.title = "AI Gateway"
+        window.title = tr("app.name")
         window.minSize = NSSize(width: 920, height: 640)
         window.center()
 
@@ -68,19 +72,19 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
         mark.layer?.cornerRadius = 10
         panel.addSubview(mark)
 
-        let title = NSTextField(labelWithString: "AI Gateway")
+        let title = NSTextField(labelWithString: tr("app.name"))
         title.translatesAutoresizingMaskIntoConstraints = false
         title.font = .systemFont(ofSize: 24, weight: .semibold)
         title.textColor = .white
         panel.addSubview(title)
 
-        let subtitle = NSTextField(wrappingLabelWithString: "选择本地端口后，将在此窗口内打开网关控制台。")
+        let subtitle = NSTextField(wrappingLabelWithString: tr("start.subtitle"))
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = .systemFont(ofSize: 14)
         subtitle.textColor = NSColor(red: 0.592, green: 0.643, blue: 0.722, alpha: 1)
         panel.addSubview(subtitle)
 
-        let label = NSTextField(labelWithString: "启动端口")
+        let label = NSTextField(labelWithString: tr("start.port"))
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = NSColor(red: 0.592, green: 0.643, blue: 0.722, alpha: 1)
@@ -92,7 +96,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
         portField.focusRingType = .none
         panel.addSubview(portField)
 
-        startButton = NSButton(title: "启动", target: self, action: #selector(startClicked))
+        startButton = NSButton(title: tr("start.button"), target: self, action: #selector(startClicked))
         startButton.translatesAutoresizingMaskIntoConstraints = false
         startButton.bezelStyle = .rounded
         startButton.keyEquivalent = "\r"
@@ -151,23 +155,23 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
         let port = rawPort.isEmpty ? defaultPort : rawPort
 
         guard let portValue = Int(port), (1...65535).contains(portValue) else {
-            setStatus("请输入有效的数字端口。", isError: true)
+            setStatus(tr("error.invalidPort"), isError: true)
             return
         }
 
         guard isPortAvailable(portValue) else {
-            setStatus("端口 \(portValue) 已被占用，请换一个端口。", isError: true)
+            setStatus(String(format: tr("error.portInUse"), portValue), isError: true)
             return
         }
 
         startButton.isEnabled = false
-        setStatus("启动中...", isError: false)
+        setStatus(tr("status.starting"), isError: false)
 
         do {
             try startBackend(port: port)
         } catch {
             startButton.isEnabled = true
-            setStatus("启动失败：\(error.localizedDescription)", isError: true)
+            setStatus(String(format: tr("error.startFailed"), error.localizedDescription), isError: true)
             return
         }
 
@@ -178,7 +182,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
                 } else {
                     self.stopBackend()
                     self.startButton.isEnabled = true
-                    self.setStatus("服务启动超时，请重试。", isError: true)
+                    self.setStatus(tr("error.startTimeout"), isError: true)
                 }
             }
         }
@@ -277,9 +281,9 @@ private enum LauncherError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingResources:
-            return "找不到应用资源目录。"
+            return tr("error.missingResources")
         case .missingBackend:
-            return "找不到内置网关服务。"
+            return tr("error.missingBackend")
         }
     }
 }
