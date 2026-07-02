@@ -6,8 +6,12 @@ This package runs AI Gateway locally without Docker.
 
 ### macOS
 
-```bash
-./ai-gateway
+Double-click `AI Gateway.app`, choose a port in the dialog, and the dashboard will open in your browser.
+
+Captured logs are stored at:
+
+```text
+~/Library/Application Support/AI Gateway/ai_gateway.sqlite3
 ```
 
 ### Windows
@@ -26,17 +30,13 @@ The dashboard opens at:
 http://127.0.0.1:<port>/
 ```
 
-Captured logs are stored next to the executable:
+Windows captured logs are stored next to the executable:
 
 ```text
 data/ai_gateway.sqlite3
 ```
 
-You can also pass the port directly:
-
-```bash
-./ai-gateway --port 20000
-```
+You can also pass the Windows port directly:
 
 ```powershell
 .\ai-gateway.exe --port 20000

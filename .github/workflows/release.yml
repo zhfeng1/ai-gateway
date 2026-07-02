@@ -18,12 +18,18 @@ jobs:
         include:
           - os: macos-14
             artifact_name: ai-gateway-macos
-            executable_name: ai-gateway
+            executable_path: AI Gateway.app/Contents/MacOS/AI Gateway
             archive_name: ai-gateway-macos.zip
+            entry_point: mac_launcher.py
+            app_name: AI Gateway
+            windowed: "--windowed"
           - os: windows-latest
             artifact_name: ai-gateway-windows-x64
-            executable_name: ai-gateway.exe
+            executable_path: ai-gateway.exe
             archive_name: ai-gateway-windows-x64.zip
+            entry_point: launcher.py
+            app_name: ai-gateway
+            windowed: ""
 
     steps:
       - name: Checkout
@@ -43,21 +49,27 @@ jobs:
           pyinstaller
           --clean
           --noconfirm
-          --name ai-gateway
+          --name "${{ matrix.app_name }}"
+          ${{ matrix.windowed }}
           --collect-all uvicorn
           --collect-all websockets
           --collect-all httptools
           --collect-all watchfiles
           --collect-all anyio
           --collect-all httpx
-          launcher.py
+          "${{ matrix.entry_point }}"
 
       - name: Prepare package
         shell: bash
         run: |
           mkdir -p "package/${{ matrix.artifact_name }}"
-          cp -R dist/ai-gateway/. "package/${{ matrix.artifact_name }}/"
+          if [ -d "dist/${{ matrix.app_name }}.app" ]; then
+            cp -R "dist/${{ matrix.app_name }}.app" "package/${{ matrix.artifact_name }}/"
+          else
+            cp -R "dist/${{ matrix.app_name }}/." "package/${{ matrix.artifact_name }}/"
+          fi
           cp RELEASE.md "package/${{ matrix.artifact_name }}/README.md"
+          cp README.zh-CN.md "package/${{ matrix.artifact_name }}/README.zh-CN.md"
           mkdir -p "package/${{ matrix.artifact_name }}/data"
 
       - name: Archive package
@@ -69,8 +81,8 @@ jobs:
           from pathlib import Path
 
           root = Path("package") / "${{ matrix.artifact_name }}"
-          executable = root / "${{ matrix.executable_name }}"
-          if os.name != "nt":
+          executable = root / "${{ matrix.executable_path }}"
+          if executable.exists() and os.name != "nt":
               executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
           with zipfile.ZipFile("${{ matrix.archive_name }}", "w", zipfile.ZIP_DEFLATED) as archive:

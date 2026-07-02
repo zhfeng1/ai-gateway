@@ -29,11 +29,7 @@ Paths, query strings, request headers, request body, response headers, response 
 
 GitHub Releases include macOS and Windows packages built by GitHub Actions.
 
-Run the executable and choose a port when prompted:
-
-```bash
-./ai-gateway
-```
+On macOS, double-click `AI Gateway.app`, choose a port in the dialog, and the dashboard opens in the browser.
 
 ```powershell
 .\ai-gateway.exe
@@ -45,7 +41,7 @@ You can also pass a port directly:
 ./ai-gateway --port 20000
 ```
 
-The local package stores logs in `data/ai_gateway.sqlite3` next to the executable.
+The Windows package stores logs in `data/ai_gateway.sqlite3` next to the executable. The macOS app stores logs in `~/Library/Application Support/AI Gateway/ai_gateway.sqlite3`.
 
 ## CI/CD
 
