@@ -1,0 +1,102 @@
+name: Release Packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            artifact_name: ai-gateway-macos-x64
+            executable_name: ai-gateway
+            archive_name: ai-gateway-macos-x64.zip
+          - os: macos-14
+            artifact_name: ai-gateway-macos-arm64
+            executable_name: ai-gateway
+            archive_name: ai-gateway-macos-arm64.zip
+          - os: windows-latest
+            artifact_name: ai-gateway-windows-x64
+            executable_name: ai-gateway.exe
+            archive_name: ai-gateway-windows-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-release.txt
+
+      - name: Build executable
+        run: >
+          pyinstaller
+          --clean
+          --noconfirm
+          --name ai-gateway
+          --collect-all uvicorn
+          --collect-all websockets
+          --collect-all httptools
+          --collect-all watchfiles
+          --collect-all anyio
+          --collect-all httpx
+          launcher.py
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          mkdir -p "package/${{ matrix.artifact_name }}"
+          cp -R dist/ai-gateway/. "package/${{ matrix.artifact_name }}/"
+          cp RELEASE.md "package/${{ matrix.artifact_name }}/README.md"
+          mkdir -p "package/${{ matrix.artifact_name }}/data"
+
+      - name: Archive package
+        shell: python
+        run: |
+          import os
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          root = Path("package") / "${{ matrix.artifact_name }}"
+          executable = root / "${{ matrix.executable_name }}"
+          if os.name != "nt":
+              executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+          with zipfile.ZipFile("${{ matrix.archive_name }}", "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in root.rglob("*"):
+                  info = zipfile.ZipInfo.from_file(path, path.relative_to("package"))
+                  if path == executable and os.name != "nt":
+                      info.external_attr = (path.stat().st_mode & 0xFFFF) << 16
+                  if path.is_dir():
+                      archive.writestr(info, "")
+                  else:
+                      with path.open("rb") as file:
+                          archive.writestr(info, file.read())
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive_name }}

@@ -1,0 +1,16 @@
+.git
+.github
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

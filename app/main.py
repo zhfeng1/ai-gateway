@@ -1,0 +1,1517 @@
+import asyncio
+import base64
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime, timezone
+from typing import AsyncIterator
+from urllib.parse import urlsplit
+
+import httpx
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/ai_gateway.sqlite3")
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "600"))
+MAX_CAPTURE_BYTES = int(os.getenv("MAX_CAPTURE_BYTES", "0"))
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "host",
+    "date",
+    "server",
+}
+
+app = FastAPI(title="AI Gateway", docs_url=None, redoc_url=None)
+
+
+class LogSocketManager:
+    def __init__(self) -> None:
+        self.connections: set[WebSocket] = set()
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.connections.add(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        self.connections.discard(websocket)
+
+    async def broadcast(self, payload: dict) -> None:
+        dead_connections = []
+        for websocket in list(self.connections):
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                dead_connections.append(websocket)
+        for websocket in dead_connections:
+            self.disconnect(websocket)
+
+
+log_socket_manager = LogSocketManager()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_db() -> None:
+    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                method TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                client_host TEXT,
+                request_headers TEXT NOT NULL,
+                request_body BLOB NOT NULL,
+                request_body_truncated INTEGER NOT NULL DEFAULT 0,
+                response_status INTEGER,
+                response_headers TEXT,
+                response_body BLOB NOT NULL DEFAULT X'',
+                response_body_truncated INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                duration_ms INTEGER,
+                upstream_duration_ms INTEGER
+            )
+            """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
+        if "upstream_duration_ms" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN upstream_duration_ms INTEGER")
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    ensure_db()
+
+
+def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    ensure_db()
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur
+    finally:
+        conn.close()
+
+
+def create_log(
+    method: str,
+    target_url: str,
+    client_host: str | None,
+    request_headers: dict[str, str],
+    request_body: bytes,
+    request_body_truncated: bool,
+) -> int:
+    cur = db_execute(
+        """
+        INSERT INTO request_logs (
+            created_at, method, target_url, client_host, request_headers,
+            request_body, request_body_truncated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(),
+            method,
+            target_url,
+            client_host,
+            json.dumps(request_headers, ensure_ascii=False, indent=2),
+            request_body,
+            int(request_body_truncated),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def finish_log(
+    log_id: int,
+    status_code: int | None,
+    response_headers: dict[str, str] | None,
+    response_body: bytes | bytearray,
+    response_body_truncated: bool,
+    started_at: float,
+    upstream_started_at: float | None = None,
+    finished_at: float | None = None,
+    error: str | None = None,
+) -> None:
+    finished_at = finished_at or time.perf_counter()
+    upstream_duration_ms = None
+    if upstream_started_at is not None:
+        upstream_duration_ms = int((finished_at - upstream_started_at) * 1000)
+    db_execute(
+        """
+        UPDATE request_logs
+        SET response_status = ?,
+            response_headers = ?,
+            response_body = ?,
+            response_body_truncated = ?,
+            error = ?,
+            duration_ms = ?,
+            upstream_duration_ms = ?
+        WHERE id = ?
+        """,
+        (
+            status_code,
+            json.dumps(response_headers or {}, ensure_ascii=False, indent=2),
+            bytes(response_body),
+            int(response_body_truncated),
+            error,
+            int((finished_at - started_at) * 1000),
+            upstream_duration_ms,
+            log_id,
+        ),
+    )
+
+
+def capture_bytes(data: bytes) -> tuple[bytes, bool]:
+    if MAX_CAPTURE_BYTES <= 0 or len(data) <= MAX_CAPTURE_BYTES:
+        return data, False
+    return data[:MAX_CAPTURE_BYTES], True
+
+
+def append_capture(existing: bytearray, chunk: bytes) -> bool:
+    if MAX_CAPTURE_BYTES <= 0:
+        existing.extend(chunk)
+        return False
+    remaining = MAX_CAPTURE_BYTES - len(existing)
+    if remaining > 0:
+        existing.extend(chunk[:remaining])
+    return len(chunk) > remaining
+
+
+def filtered_request_headers(request: Request) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+    }
+
+
+def filtered_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+    }
+
+
+def validate_target_url(target_url: str) -> str | None:
+    parsed = urlsplit(target_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "Target URL must start with http:// or https://"
+    return None
+
+
+def row_to_summary(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "method": row["method"],
+        "target_url": row["target_url"],
+        "client_host": row["client_host"],
+        "response_status": row["response_status"],
+        "duration_ms": row["duration_ms"],
+        "upstream_duration_ms": row["upstream_duration_ms"],
+        "gateway_overhead_ms": (
+            row["duration_ms"] - row["upstream_duration_ms"]
+            if row["duration_ms"] is not None and row["upstream_duration_ms"] is not None
+            else None
+        ),
+        "error": row["error"],
+        "request_body_bytes": len(row["request_body"] or b""),
+        "response_body_bytes": len(row["response_body"] or b""),
+        "request_body_truncated": bool(row["request_body_truncated"]),
+        "response_body_truncated": bool(row["response_body_truncated"]),
+    }
+
+
+def list_log_summaries(limit: int = 100) -> list[dict]:
+    limit = max(1, min(limit, 500))
+    ensure_db()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, created_at, method, target_url, client_host, response_status,
+                   duration_ms, upstream_duration_ms, error, request_body, response_body,
+                   request_body_truncated, response_body_truncated
+            FROM request_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row_to_summary(row) for row in rows]
+
+
+async def broadcast_logs(changed_id: int | None = None) -> None:
+    rows = await asyncio.to_thread(list_log_summaries, 50)
+    await log_socket_manager.broadcast(
+        {
+            "type": "logs",
+            "changed_id": changed_id,
+            "rows": rows,
+        }
+    )
+
+
+async def announce_created(log_id_task: asyncio.Task[int]) -> None:
+    try:
+        log_id = await log_id_task
+        await broadcast_logs(log_id)
+    except Exception as exc:
+        print(f"Failed to announce log creation: {exc}", flush=True)
+
+
+async def finish_log_async(log_id_task: asyncio.Task[int], *args) -> None:
+    try:
+        log_id = await log_id_task
+        await asyncio.to_thread(finish_log, log_id, *args)
+        await broadcast_logs(log_id)
+    except Exception as exc:
+        print(f"Failed to finish log: {exc}", flush=True)
+
+
+def body_payload(body: bytes) -> dict:
+    try:
+        text = body.decode("utf-8")
+        return {"encoding": "utf-8", "text": text}
+    except UnicodeDecodeError:
+        return {
+            "encoding": "base64",
+            "text": base64.b64encode(body).decode("ascii"),
+        }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f5f7fb" />
+  <title>AI Gateway</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080b10;
+      --panel: #10151f;
+      --panel-soft: #151b27;
+      --panel-raised: #192231;
+      --line: #253044;
+      --line-strong: #3d4b63;
+      --text: #f4f7fb;
+      --muted: #97a4b8;
+      --muted-strong: #c7d1df;
+      --accent: #27d17f;
+      --accent-2: #35b7ff;
+      --accent-soft: rgba(39, 209, 127, .12);
+      --warn: #f5b84b;
+      --good: #33d17a;
+      --bad: #ff5c73;
+      --code-bg: #05070b;
+      --code-text: #dce7f5;
+      --shadow: 0 20px 50px rgba(0, 0, 0, .28);
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 18% 0%, rgba(53, 183, 255, .12), transparent 32%),
+        radial-gradient(circle at 78% 0%, rgba(39, 209, 127, .10), transparent 30%),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow-x: hidden;
+      -webkit-tap-highlight-color: rgba(39, 209, 127, .18);
+    }
+    a, button, input { touch-action: manipulation; }
+    .skip-link {
+      position: absolute;
+      left: 12px;
+      top: -44px;
+      z-index: 5;
+      background: var(--text);
+      color: #fff;
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+    .skip-link:focus-visible { top: 10px; outline: 3px solid #7dd3fc; outline-offset: 2px; }
+    .shell {
+      min-height: 100dvh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    header.app-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 14px max(20px, env(safe-area-inset-left)) 14px max(20px, env(safe-area-inset-right));
+      border-bottom: 1px solid var(--line);
+      background: rgba(16, 21, 31, .9);
+      backdrop-filter: blur(14px);
+      position: sticky;
+      top: 0;
+      z-index: 3;
+    }
+    h1 {
+      font-size: 18px;
+      line-height: 1.15;
+      margin: 0;
+      font-weight: 760;
+      text-wrap: balance;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 9px;
+      display: grid;
+      place-items: center;
+      background: #0b2017;
+      border: 1px solid rgba(39, 209, 127, .42);
+      color: var(--accent);
+      box-shadow: 0 0 24px rgba(39, 209, 127, .16);
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      flex: 0 0 auto;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: #111827;
+      color: var(--text);
+      min-height: 40px;
+      padding: 0 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font: inherit;
+      transition: border-color .18s ease, background-color .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+    button:hover {
+      border-color: rgba(39, 209, 127, .48);
+      color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 3px rgba(39, 209, 127, .06);
+    }
+    button:focus-visible,
+    input:focus-visible {
+      outline: 3px solid rgba(14, 165, 233, .35);
+      outline-offset: 2px;
+      border-color: var(--accent);
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: var(--good);
+      box-shadow: 0 0 0 3px rgba(21, 128, 61, .13);
+    }
+    .live-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 12px;
+      background: rgba(5, 7, 11, .34);
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(380px, 34%) minmax(0, 1fr);
+      min-height: calc(100dvh - 69px);
+    }
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: rgba(10, 14, 21, .78);
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .filters {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(16, 21, 31, .82);
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    input[type="search"] {
+      width: 100%;
+      height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      color: var(--text);
+      background: var(--code-bg);
+      padding: 0 12px;
+      font: inherit;
+    }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .metric {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(25, 34, 49, .98), rgba(16, 21, 31, .98));
+      padding: 10px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .metric strong {
+      display: block;
+      margin-top: 2px;
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+    }
+    .list {
+      overflow: auto;
+      max-height: calc(100dvh - 190px);
+      padding: 8px;
+    }
+    .item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      height: auto;
+      min-height: 88px;
+      padding: 12px;
+      display: grid;
+      gap: 7px;
+      background: transparent;
+      content-visibility: auto;
+      contain-intrinsic-size: 86px;
+    }
+    .item + .item { margin-top: 6px; }
+    .item:hover {
+      background: rgba(25, 34, 49, .72);
+      border-color: var(--line);
+    }
+    .item.active {
+      background: linear-gradient(180deg, rgba(39, 209, 127, .13), rgba(53, 183, 255, .08));
+      border-color: rgba(39, 209, 127, .42);
+      box-shadow: inset 3px 0 0 var(--accent), 0 12px 28px rgba(0, 0, 0, .20);
+    }
+    .meta {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .meta .grow { flex: 1; min-width: 0; }
+    .method {
+      color: var(--accent);
+      font-weight: 800;
+      min-width: 46px;
+      letter-spacing: .02em;
+    }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: rgba(5, 7, 11, .62);
+      font-weight: 700;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .status.ok { color: var(--good); border-color: rgba(21, 128, 61, .3); }
+    .status.err { color: var(--bad); border-color: rgba(185, 28, 28, .3); }
+    .status.warn { color: var(--warn); border-color: rgba(180, 83, 9, .3); }
+    .url {
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      min-width: 0;
+    }
+    .detail {
+      padding: 18px;
+      overflow: auto;
+      max-height: calc(100dvh - 69px);
+      min-width: 0;
+    }
+    .empty {
+      min-height: 220px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+      padding: 24px;
+    }
+    .detail-head {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 16px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(16, 21, 31, .88);
+      box-shadow: var(--shadow);
+    }
+    .title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .title-row h2 { flex: 1; min-width: 0; }
+    h2 {
+      font-size: 18px;
+      margin: 0;
+      line-height: 1.35;
+      text-wrap: balance;
+      overflow-wrap: anywhere;
+    }
+    h3 {
+      font-size: 12px;
+      margin: 0 0 8px;
+      color: var(--muted);
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    section {
+      margin-bottom: 14px;
+      scroll-margin-top: 84px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(16, 21, 31, .78);
+      padding: 14px;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      max-height: 44vh;
+    }
+    .json-viewer {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 10px 12px;
+      overflow: auto;
+      max-height: 52vh;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .json-node,
+    .json-leaf { margin: 2px 0; }
+    .json-node summary {
+      cursor: pointer;
+      min-height: 24px;
+      display: grid;
+      grid-template-columns: 14px minmax(0, auto) auto 1fr;
+      align-items: center;
+      column-gap: 6px;
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+      list-style: none;
+    }
+    .json-node summary::-webkit-details-marker { display: none; }
+    .json-node summary::before {
+      content: "▶";
+      color: #93c5fd;
+      font-size: 10px;
+      line-height: 1;
+      transform-origin: center;
+    }
+    .json-node[open] > summary::before { content: "▼"; }
+    .json-node summary:hover { background: rgba(219, 234, 254, .08); }
+    .json-node summary:focus-visible {
+      outline: 2px solid rgba(125, 211, 252, .7);
+      outline-offset: 2px;
+    }
+    .json-children {
+      margin-left: 7px;
+      padding-left: 10px;
+      border-left: 1px solid rgba(219, 234, 254, .22);
+    }
+    .json-key { color: #93c5fd; }
+    .json-type { color: #a7f3d0; }
+    .json-string { color: #fde68a; overflow-wrap: anywhere; }
+    .json-number { color: #f9a8d4; }
+    .json-boolean { color: #c4b5fd; }
+    .json-null { color: #94a3b8; }
+    .json-preview { color: #94a3b8; }
+    .json-leaf {
+      display: grid;
+      grid-template-columns: 14px minmax(0, auto) minmax(0, 1fr);
+      align-items: start;
+      column-gap: 6px;
+      min-height: 22px;
+      overflow-wrap: anywhere;
+    }
+    .json-leaf::before {
+      content: "";
+      width: 14px;
+    }
+    .kv {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--code-bg);
+    }
+    .kv-row {
+      display: grid;
+      grid-template-columns: minmax(140px, 28%) minmax(0, 1fr);
+      border-top: 1px solid var(--line);
+    }
+    .kv-row:first-child { border-top: 0; }
+    .kv-key,
+    .kv-value {
+      padding: 9px 10px;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .kv-key {
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-weight: 700;
+      border-right: 1px solid var(--line);
+    }
+    .kv-value { color: var(--code-text); }
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 8px;
+    }
+    .fact {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(5, 7, 11, .42);
+      padding: 11px;
+      min-width: 0;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+    }
+    .fact strong {
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .label { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--line);
+      margin: 2px 0 14px;
+      overflow-x: auto;
+      background: rgba(16, 21, 31, .72);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 4px;
+    }
+    .tab {
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      height: 38px;
+      flex: 0 0 auto;
+    }
+    .tab:hover { background: rgba(255, 255, 255, .04); color: var(--text); }
+    .tab.active {
+      color: var(--accent);
+      background: rgba(39, 209, 127, .12);
+      box-shadow: inset 0 0 0 1px rgba(39, 209, 127, .22);
+    }
+    .copy-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .copy-row h3 { margin: 0; }
+    .row-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .view-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--code-bg);
+    }
+    .view-switch button {
+      height: 28px;
+      padding: 0 9px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+    }
+    .view-switch button.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      box-shadow: inset 0 0 0 1px rgba(15, 118, 110, .18);
+    }
+    .secondary { color: var(--muted); }
+    [hidden] { display: none !important; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+      }
+    }
+    @media (max-width: 820px) {
+      main { grid-template-columns: 1fr; }
+      header.app-header { align-items: flex-start; flex-direction: column; }
+      .toolbar { width: 100%; justify-content: space-between; }
+      .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+      .list { max-height: 42vh; }
+      .detail { max-height: none; }
+      .title-row { flex-direction: column; }
+      .kv-row { grid-template-columns: 1fr; }
+      .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#detail">跳到请求详情</a>
+  <div class="shell">
+    <header class="app-header">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">AI</div>
+        <div>
+          <h1 translate="no">AI Gateway</h1>
+          <div class="subtitle">Realtime proxy inspector</div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="live-status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="liveText">连接中…</span></div>
+        <button id="refresh" type="button">刷新详情</button>
+      </div>
+    </header>
+    <main>
+      <aside class="sidebar" aria-label="请求记录">
+        <div class="filters">
+          <label for="search">
+            搜索请求
+            <input id="search" name="gateway-search" type="search" autocomplete="off" placeholder="例如 /v1/chat/completions…" />
+          </label>
+          <div class="summary-strip" aria-label="记录统计">
+            <div class="metric"><span>Total</span><strong id="totalCount">0</strong></div>
+            <div class="metric"><span>Success</span><strong id="successCount">0</strong></div>
+            <div class="metric"><span>Errors</span><strong id="errorCount">0</strong></div>
+          </div>
+        </div>
+        <nav class="list" id="list" aria-label="最近请求"></nav>
+      </aside>
+      <section class="detail" id="detail" tabindex="-1" aria-live="polite">
+        <div class="empty">暂无记录</div>
+      </section>
+    </main>
+  </div>
+  <script>
+    const listEl = document.getElementById('list');
+    const detailEl = document.getElementById('detail');
+    const searchEl = document.getElementById('search');
+    const liveTextEl = document.getElementById('liveText');
+    const totalCountEl = document.getElementById('totalCount');
+    const successCountEl = document.getElementById('successCount');
+    const errorCountEl = document.getElementById('errorCount');
+    const dateFormatter = new Intl.DateTimeFormat(navigator.languages, {
+      month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const numberFormatter = new Intl.NumberFormat(navigator.languages);
+    const byteFormatter = new Intl.NumberFormat(navigator.languages, { maximumFractionDigits: 1 });
+    let activeId = null;
+    let activeTab = 'request';
+    let rowsCache = [];
+    let activeResponseBodyView = 'json';
+    let activeDetailPending = false;
+    let logSocket = null;
+    let reconnectTimer = null;
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    function statusClass(status) {
+      if (!status) return 'warn';
+      return status >= 200 && status < 400 ? 'ok' : 'err';
+    }
+
+    function statusLabel(row) {
+      return row.response_status ?? (row.error ? 'error' : 'pending');
+    }
+
+    function formatDate(value) {
+      return value ? dateFormatter.format(new Date(value)) : '-';
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (bytes < 1024) return `${numberFormatter.format(bytes)} B`;
+      if (bytes < 1024 * 1024) return `${byteFormatter.format(bytes / 1024)} KB`;
+      return `${byteFormatter.format(bytes / 1024 / 1024)} MB`;
+    }
+
+    function formatMs(value) {
+      return value === null || value === undefined ? '-' : `${numberFormatter.format(value)} ms`;
+    }
+
+    function gatewayOverhead(row) {
+      if (row.gateway_overhead_ms !== undefined && row.gateway_overhead_ms !== null) return row.gateway_overhead_ms;
+      if (row.duration_ms === null || row.duration_ms === undefined) return null;
+      if (row.upstream_duration_ms === null || row.upstream_duration_ms === undefined) return null;
+      return row.duration_ms - row.upstream_duration_ms;
+    }
+
+    function formatHeaderText(headers) {
+      return Object.entries(headers || {})
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\\n');
+    }
+
+    function renderHeaders(headers) {
+      const entries = Object.entries(headers || {});
+      if (!entries.length) return '<div class="empty">没有 Header</div>';
+      return `<div class="kv">${entries.map(([key, value]) => `
+        <div class="kv-row">
+          <div class="kv-key" translate="no">${esc(key)}</div>
+          <div class="kv-value" translate="no">${esc(value)}</div>
+        </div>
+      `).join('')}</div>`;
+    }
+
+    function prettyBody(body) {
+      const text = body || '';
+      if (!text.trim()) return '(empty)';
+      try {
+        return JSON.stringify(JSON.parse(text), null, 2);
+      } catch {
+        return text;
+      }
+    }
+
+    function jsonSummary(value) {
+      if (Array.isArray(value)) return `Array(${numberFormatter.format(value.length)})`;
+      if (value && typeof value === 'object') return `Object(${numberFormatter.format(Object.keys(value).length)})`;
+      return typeof value;
+    }
+
+    function primitiveClass(value) {
+      if (value === null) return 'json-null';
+      if (typeof value === 'string') return 'json-string';
+      if (typeof value === 'number') return 'json-number';
+      if (typeof value === 'boolean') return 'json-boolean';
+      return 'json-preview';
+    }
+
+    function primitivePreview(value) {
+      if (value === null) return 'null';
+      if (typeof value === 'string') return JSON.stringify(value);
+      return String(value);
+    }
+
+    function renderJsonValue(value, key = '', depth = 0) {
+      const keyHtml = key === '' ? '' : `<span class="json-key">${esc(key)}:</span>`;
+      if (value && typeof value === 'object') {
+        const isArray = Array.isArray(value);
+        const entries = isArray ? value.map((item, index) => [String(index), item]) : Object.entries(value);
+        return `
+          <details class="json-node" ${depth === 0 ? 'open' : ''}>
+            <summary>${keyHtml}<span class="json-type">${isArray ? 'Array' : 'Object'}</span><span class="json-preview">${esc(jsonSummary(value))}</span></summary>
+            <div class="json-children">
+              ${entries.length ? entries.map(([childKey, childValue]) => renderJsonValue(childValue, childKey, depth + 1)).join('') : '<div class="json-leaf json-preview">(empty)</div>'}
+            </div>
+          </details>
+        `;
+      }
+      return `<div class="json-leaf">${keyHtml}<span class="${primitiveClass(value)}">${esc(primitivePreview(value))}</span></div>`;
+    }
+
+    function renderBodyContent(text) {
+      const body = text || '';
+      if (!body.trim()) return '<pre translate="no">(empty)</pre>';
+      try {
+        return `<div class="json-viewer" translate="no">${renderJsonValue(JSON.parse(body))}</div>`;
+      } catch {
+        return `<pre translate="no">${esc(body)}</pre>`;
+      }
+    }
+
+    function isSseResponse(row) {
+      const contentType = Object.entries(row.response_headers || {})
+        .find(([key]) => key.toLowerCase() === 'content-type')?.[1] || '';
+      return contentType.toLowerCase().includes('text/event-stream') || /^event:|\\ndata:/m.test(row.response_body.text || '');
+    }
+
+    function parseSseEvents(text) {
+      const blocks = String(text || '').split(/\\r?\\n\\r?\\n/);
+      const events = [];
+      for (const block of blocks) {
+        let eventName = '';
+        const dataLines = [];
+        for (const rawLine of block.split(/\\r?\\n/)) {
+          const line = rawLine.trimEnd();
+          if (line.startsWith('event:')) eventName = line.slice(6).trim();
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+        }
+        if (dataLines.length) {
+          const data = dataLines.join('\\n');
+          events.push({ event: eventName || 'message', data });
+        }
+      }
+      return events;
+    }
+
+    function tryParseJson(text) {
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    }
+
+    function completedResponseJsonFromSse(text) {
+      const events = parseSseEvents(text);
+
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const item = events[index];
+        if (item.event === 'response.completed') {
+          const parsed = tryParseJson(item.data);
+          return parsed ? JSON.stringify(parsed, null, 2) : item.data;
+        }
+      }
+
+      const chatChunks = events
+        .filter(item => item.data !== '[DONE]')
+        .map(item => tryParseJson(item.data))
+        .filter(Boolean)
+        .filter(item => Array.isArray(item.choices));
+      if (chatChunks.length) {
+        const content = chatChunks
+          .map(item => item.choices?.[0]?.delta?.content || item.choices?.[0]?.message?.content || '')
+          .join('');
+        const toolCalls = chatChunks
+          .flatMap(item => item.choices?.[0]?.delta?.tool_calls || [])
+          .filter(Boolean);
+        const lastChunk = chatChunks[chatChunks.length - 1];
+        return JSON.stringify(
+          {
+            type: 'chat.completions',
+            id: lastChunk.id || chatChunks[0].id || null,
+            model: lastChunk.model || chatChunks[0].model || null,
+            content,
+            tool_calls: toolCalls,
+            finish_reason: lastChunk.choices?.[0]?.finish_reason || null,
+            chunks: chatChunks,
+          },
+          null,
+          2
+        );
+      }
+
+      const messageEvents = events
+        .map(item => ({ event: item.event, data: tryParseJson(item.data) }))
+        .filter(item => item.data);
+      if (messageEvents.some(item => item.event.startsWith('message_') || item.event.startsWith('content_block_'))) {
+        const content = messageEvents
+          .map(item => item.data.delta?.text || item.data.content_block?.text || '')
+          .join('');
+        const messageStart = messageEvents.find(item => item.event === 'message_start')?.data?.message || null;
+        let messageDelta = null;
+        for (let index = messageEvents.length - 1; index >= 0; index -= 1) {
+          if (messageEvents[index].event === 'message_delta') {
+            messageDelta = messageEvents[index].data;
+            break;
+          }
+        }
+        return JSON.stringify(
+          {
+            type: 'messages',
+            message: messageStart,
+            content,
+            stop_reason: messageDelta?.delta?.stop_reason || null,
+            usage: messageDelta?.usage || messageStart?.usage || null,
+            events: messageEvents,
+          },
+          null,
+          2
+        );
+      }
+
+      return '';
+    }
+
+    function updateUrlState() {
+      const params = new URLSearchParams(window.location.search);
+      if (activeId) params.set('id', String(activeId));
+      params.set('tab', activeTab);
+      const q = searchEl.value.trim();
+      if (q) params.set('q', q);
+      else params.delete('q');
+      const next = `${window.location.pathname}?${params.toString()}`;
+      window.history.replaceState(null, '', next);
+    }
+
+    function filteredRows() {
+      const q = searchEl.value.trim().toLowerCase();
+      if (!q) return rowsCache;
+      return rowsCache.filter(row => {
+        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''}`.toLowerCase().includes(q);
+      });
+    }
+
+    function renderList() {
+      const rows = filteredRows();
+      const success = rows.filter(row => row.response_status >= 200 && row.response_status < 400).length;
+      const errors = rows.filter(row => row.error || row.response_status >= 400).length;
+      totalCountEl.textContent = numberFormatter.format(rows.length);
+      successCountEl.textContent = numberFormatter.format(success);
+      errorCountEl.textContent = numberFormatter.format(errors);
+
+      if (!rows.length) {
+        listEl.innerHTML = '<div class="empty">没有匹配的请求记录</div>';
+        if (!rowsCache.length) detailEl.innerHTML = '<div class="empty">暂无记录</div>';
+        return;
+      }
+
+      listEl.innerHTML = rows.map(row => `
+        <button class="item ${row.id === activeId ? 'active' : ''}" type="button" data-id="${row.id}" aria-current="${row.id === activeId ? 'true' : 'false'}">
+          <div class="meta">
+            <span class="method" translate="no">${esc(row.method)}</span>
+            <span class="badge status ${statusClass(row.response_status)}">${esc(statusLabel(row))}</span>
+            <span class="grow"></span>
+            <span>${esc(formatMs(row.duration_ms))}</span>
+          </div>
+          <div class="url" translate="no">${esc(row.target_url)}</div>
+          <div class="meta">
+            <span>#${numberFormatter.format(row.id)}</span>
+            <span>${esc(formatDate(row.created_at))}</span>
+            <span>Req ${esc(formatBytes(row.request_body_bytes))}</span>
+            <span>Res ${esc(formatBytes(row.response_body_bytes))}</span>
+          </div>
+        </button>
+      `).join('');
+      listEl.querySelectorAll('.item').forEach(item => {
+        item.addEventListener('click', () => loadDetail(Number(item.dataset.id)));
+      });
+    }
+
+    function applyRows(rows, { refreshPendingDetail = false } = {}) {
+      rowsCache = rows;
+      renderList();
+      if (refreshPendingDetail && activeId && activeDetailPending && rowsCache.some(row => row.id === activeId)) {
+        loadDetail(activeId, false);
+      }
+      liveTextEl.textContent = `最近更新 ${dateFormatter.format(new Date())}`;
+    }
+
+    async function loadList({ refreshDetail = true } = {}) {
+      liveTextEl.textContent = '正在加载…';
+      const res = await fetch('/api/logs?limit=50');
+      const rows = await res.json();
+      applyRows(rows);
+      const params = new URLSearchParams(window.location.search);
+      const selected = Number(params.get('id')) || activeId || rowsCache[0]?.id;
+      const nextTab = params.get('tab');
+      if (nextTab) activeTab = nextTab;
+      if (selected && rowsCache.some(row => row.id === selected)) {
+        await loadDetail(selected, false);
+      } else if (!rowsCache.length) {
+        detailEl.innerHTML = '<div class="empty">暂无记录</div>';
+      }
+      liveTextEl.textContent = `最近更新 ${dateFormatter.format(new Date())}`;
+    }
+
+    function connectLogSocket() {
+      if (logSocket && (logSocket.readyState === WebSocket.OPEN || logSocket.readyState === WebSocket.CONNECTING)) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      logSocket = new WebSocket(`${protocol}//${window.location.host}/ws/logs`);
+      logSocket.addEventListener('open', () => {
+        liveTextEl.textContent = 'WebSocket 已连接';
+      });
+      logSocket.addEventListener('message', event => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'logs' && Array.isArray(message.rows)) {
+            applyRows(message.rows, { refreshPendingDetail: true });
+          }
+        } catch {
+          liveTextEl.textContent = 'WebSocket 消息解析失败';
+        }
+      });
+      logSocket.addEventListener('close', () => {
+        liveTextEl.textContent = 'WebSocket 已断开，准备重连…';
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connectLogSocket, 2000);
+      });
+      logSocket.addEventListener('error', () => {
+        logSocket.close();
+      });
+    }
+
+    function setTab(tab) {
+      activeTab = tab;
+      document.querySelectorAll('[data-panel]').forEach(panel => {
+        panel.hidden = panel.dataset.panel !== tab;
+      });
+      document.querySelectorAll('.tab').forEach(button => {
+        const isActive = button.dataset.tab === tab;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-selected', String(isActive));
+      });
+      updateUrlState();
+    }
+
+    function setResponseBodyView(view) {
+      activeResponseBodyView = view;
+      detailEl.querySelectorAll('[data-response-body-view]').forEach(panel => {
+        panel.hidden = panel.dataset.responseBodyView !== view;
+      });
+      detailEl.querySelectorAll('[data-response-view-button]').forEach(button => {
+        const isActive = button.dataset.responseViewButton === view;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', String(isActive));
+      });
+    }
+
+    async function copyText(text) {
+      await navigator.clipboard.writeText(text || '');
+      liveTextEl.textContent = '已复制到剪贴板';
+    }
+
+    async function loadDetail(id, shouldFocus = true) {
+      activeId = id;
+      const res = await fetch(`/api/logs/${id}`);
+      const row = await res.json();
+      activeDetailPending = row.response_status === null && !row.error;
+      const responseIsSse = isSseResponse(row);
+      const completedJson = responseIsSse ? completedResponseJsonFromSse(row.response_body.text) : '';
+      const responseJsonText = responseIsSse ? (completedJson || '(没有找到可解析的 SSE JSON)') : prettyBody(row.response_body.text);
+      const responseSseText = row.response_body.text || '(empty)';
+      const requestBodyText = prettyBody(row.request_body.text);
+      const requestHeaderText = formatHeaderText(row.request_headers);
+      const responseHeaderText = formatHeaderText(row.response_headers);
+      const overheadMs = gatewayOverhead(row);
+      activeResponseBodyView = responseIsSse && ['json', 'sse'].includes(activeResponseBodyView) ? activeResponseBodyView : (responseIsSse ? 'json' : 'body');
+      renderList();
+      detailEl.innerHTML = `
+        <div class="detail-head">
+          <div class="title-row">
+            <h2 translate="no">${esc(row.target_url)}</h2>
+            <button type="button" data-copy="url">复制 URL</button>
+          </div>
+          <div class="facts">
+            <div class="fact"><div class="label">Method</div><strong translate="no">${esc(row.method)}</strong></div>
+            <div class="fact"><div class="label">Status</div><strong>${esc(row.response_status ?? row.error ?? 'pending')}</strong></div>
+            <div class="fact"><div class="label">本项目耗时</div><strong>${esc(formatMs(row.duration_ms))}</strong></div>
+            <div class="fact"><div class="label">上游接口耗时</div><strong>${esc(formatMs(row.upstream_duration_ms))}</strong></div>
+            <div class="fact"><div class="label">差值</div><strong>${esc(formatMs(overheadMs))}</strong></div>
+            <div class="fact"><div class="label">Request Body</div><strong>${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</strong></div>
+            <div class="fact"><div class="label">Response Body</div><strong>${esc(formatBytes(row.response_body.text.length))}${row.response_body_truncated ? ' · truncated' : ''}</strong></div>
+            <div class="fact"><div class="label">Created</div><strong>${esc(formatDate(row.created_at))}</strong></div>
+          </div>
+        </div>
+        <div class="tabs" role="tablist" aria-label="请求详情">
+          <button class="tab" type="button" role="tab" data-tab="request">Request</button>
+          <button class="tab" type="button" role="tab" data-tab="response">Response</button>
+        </div>
+        <div data-panel="request">
+          <section>
+            <div class="copy-row"><h3>Request Header</h3><button type="button" data-copy="requestHeaders">复制 Header</button></div>
+            ${renderHeaders(row.request_headers)}
+          </section>
+          <section>
+            <div class="copy-row"><h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3><button type="button" data-copy="requestBody">复制 Body</button></div>
+            ${renderBodyContent(row.request_body.text)}
+          </section>
+        </div>
+        <div data-panel="response" hidden>
+          <section>
+            <div class="copy-row"><h3>Response Header</h3><button type="button" data-copy="responseHeaders">复制 Header</button></div>
+            ${renderHeaders(row.response_headers)}
+          </section>
+          <section>
+            <div class="copy-row">
+              <h3>Response Body${row.response_body_truncated ? ' (truncated)' : ''}</h3>
+              <div class="row-actions">
+                ${responseIsSse ? `
+                  <div class="view-switch" aria-label="Response Body 视图">
+                    <button type="button" data-response-view-button="json">JSON</button>
+                    <button type="button" data-response-view-button="sse">SSE</button>
+                  </div>
+                ` : ''}
+                <button type="button" data-copy="responseBody">复制 Body</button>
+              </div>
+            </div>
+            ${responseIsSse ? `
+              <div data-response-body-view="json">${renderBodyContent(responseJsonText)}</div>
+              <pre data-response-body-view="sse" translate="no" hidden>${esc(responseSseText)}</pre>
+            ` : `
+              <div data-response-body-view="body">${renderBodyContent(row.response_body.text)}</div>
+            `}
+          </section>
+        </div>
+      `;
+      detailEl.querySelectorAll('.tab').forEach(button => {
+        button.addEventListener('click', () => setTab(button.dataset.tab));
+      });
+      const copyMap = {
+        url: row.target_url,
+        requestHeaders: requestHeaderText,
+        requestBody: requestBodyText,
+        responseHeaders: responseHeaderText,
+        responseBody: responseIsSse ? (activeResponseBodyView === 'json' ? responseJsonText : responseSseText) : responseJsonText,
+      };
+      detailEl.querySelectorAll('[data-copy]').forEach(button => {
+        button.addEventListener('click', () => {
+          if (button.dataset.copy === 'responseBody' && responseIsSse) {
+            copyText(activeResponseBodyView === 'json' ? responseJsonText : responseSseText);
+            return;
+          }
+          copyText(copyMap[button.dataset.copy]);
+        });
+      });
+      detailEl.querySelectorAll('[data-response-view-button]').forEach(button => {
+        button.addEventListener('click', () => setResponseBodyView(button.dataset.responseViewButton));
+      });
+      setResponseBodyView(activeResponseBodyView);
+      setTab(['request', 'response'].includes(activeTab) ? activeTab : 'request');
+      if (shouldFocus) detailEl.focus({ preventScroll: true });
+    }
+
+    const initialParams = new URLSearchParams(window.location.search);
+    searchEl.value = initialParams.get('q') || '';
+    searchEl.addEventListener('input', () => {
+      renderList();
+      updateUrlState();
+    });
+    document.getElementById('refresh').addEventListener('click', () => loadList({ refreshDetail: true }));
+    loadList({ refreshDetail: true });
+    connectLogSocket();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/logs")
+async def api_logs(limit: int = 100) -> list[dict]:
+    return list_log_summaries(limit)
+
+
+@app.websocket("/ws/logs")
+async def websocket_logs(websocket: WebSocket) -> None:
+    await log_socket_manager.connect(websocket)
+    try:
+        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50)})
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        log_socket_manager.disconnect(websocket)
+
+
+@app.get("/api/logs/{log_id}")
+async def api_log_detail(log_id: int) -> JSONResponse:
+    ensure_db()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM request_logs WHERE id = ?", (log_id,)).fetchone()
+    if row is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    return JSONResponse(
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "method": row["method"],
+            "target_url": row["target_url"],
+            "client_host": row["client_host"],
+            "request_headers": json.loads(row["request_headers"] or "{}"),
+            "request_body": body_payload(row["request_body"] or b""),
+            "request_body_truncated": bool(row["request_body_truncated"]),
+            "response_status": row["response_status"],
+            "response_headers": json.loads(row["response_headers"] or "{}"),
+            "response_body": body_payload(row["response_body"] or b""),
+            "response_body_truncated": bool(row["response_body_truncated"]),
+            "error": row["error"],
+            "duration_ms": row["duration_ms"],
+            "upstream_duration_ms": row["upstream_duration_ms"],
+            "gateway_overhead_ms": (
+                row["duration_ms"] - row["upstream_duration_ms"]
+                if row["duration_ms"] is not None and row["upstream_duration_ms"] is not None
+                else None
+            ),
+        }
+    )
+
+
+@app.api_route("/{target_url:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy(target_url: str, request: Request):
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    validation_error = validate_target_url(target_url)
+    if validation_error:
+        return PlainTextResponse(validation_error, status_code=400)
+
+    started_at = time.perf_counter()
+    raw_request_body = await request.body()
+    captured_request_body, request_truncated = capture_bytes(raw_request_body)
+    log_id_task = asyncio.create_task(
+        asyncio.to_thread(
+            create_log,
+            request.method,
+            target_url,
+            request.client.host if request.client else None,
+            dict(request.headers),
+            captured_request_body,
+            request_truncated,
+        )
+    )
+    asyncio.create_task(announce_created(log_id_task))
+    response_capture = bytearray()
+    response_truncated = False
+
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=30.0)
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
+    upstream_request = client.build_request(
+        request.method,
+        target_url,
+        headers=filtered_request_headers(request),
+        content=raw_request_body,
+    )
+
+    upstream_started_at = time.perf_counter()
+    try:
+        upstream_response = await client.send(upstream_request, stream=True)
+    except Exception as exc:
+        await client.aclose()
+        finished_at = time.perf_counter()
+        body = f"Upstream request failed: {exc}".encode("utf-8")
+        asyncio.create_task(
+            finish_log_async(
+                log_id_task,
+                502,
+                {"content-type": "text/plain; charset=utf-8"},
+                body,
+                False,
+                started_at,
+                upstream_started_at,
+                finished_at,
+                str(exc),
+            )
+        )
+        return PlainTextResponse(body.decode("utf-8"), status_code=502)
+
+    response_headers = filtered_response_headers(upstream_response.headers)
+
+    async def stream_response() -> AsyncIterator[bytes]:
+        nonlocal response_truncated
+        error = None
+        try:
+            async for chunk in upstream_response.aiter_bytes():
+                response_truncated = append_capture(response_capture, chunk) or response_truncated
+                yield chunk
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            finished_at = time.perf_counter()
+            await upstream_response.aclose()
+            await client.aclose()
+            asyncio.create_task(
+                finish_log_async(
+                    log_id_task,
+                    upstream_response.status_code,
+                    dict(upstream_response.headers),
+                    response_capture,
+                    response_truncated,
+                    started_at,
+                    upstream_started_at,
+                    finished_at,
+                    error,
+                )
+            )
+
+    return StreamingResponse(
+        stream_response(),
+        status_code=upstream_response.status_code,
+        headers=response_headers,
+        media_type=upstream_response.headers.get("content-type"),
+    )

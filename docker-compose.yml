@@ -1,0 +1,13 @@
+services:
+  ai-gateway:
+    build: .
+    container_name: ai-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:20000:20000"
+    environment:
+      DATABASE_PATH: /data/ai_gateway.sqlite3
+      REQUEST_TIMEOUT_SECONDS: "600"
+      MAX_CAPTURE_BYTES: "0"
+    volumes:
+      - ./data:/data
