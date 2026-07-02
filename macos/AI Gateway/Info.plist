@@ -10,6 +10,8 @@
   <string>AI Gateway</string>
   <key>CFBundleIdentifier</key>
   <string>com.zhfeng.ai-gateway</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

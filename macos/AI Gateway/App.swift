@@ -3,8 +3,7 @@ import WebKit
 
 private let defaultPort = "20000"
 
-@main
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var startView: NSView!
@@ -284,3 +283,9 @@ private enum LauncherError: LocalizedError {
         }
     }
 }
+
+let app = NSApplication.shared
+let delegate = LauncherAppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.regular)
+app.run()
