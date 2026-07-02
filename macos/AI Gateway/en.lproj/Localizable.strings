@@ -2,6 +2,7 @@
 "start.subtitle" = "Choose a local port, then the gateway dashboard opens in this window.";
 "start.port" = "Port";
 "start.button" = "Start";
+"menu.quit" = "Quit %@";
 "status.starting" = "Starting...";
 "error.invalidPort" = "Enter a valid numeric port.";
 "error.portInUse" = "Port %d is already in use. Choose another port.";

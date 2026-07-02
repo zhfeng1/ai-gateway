@@ -7,7 +7,7 @@ private func tr(_ key: String) -> String {
     NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
 }
 
-final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var startView: NSView!
@@ -17,6 +17,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
     private var backendProcess: Process?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        buildMenu()
         buildWindow()
     }
 
@@ -24,8 +25,31 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
         true
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        stopBackend(force: true)
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        stopBackend()
+        stopBackend(force: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.terminate(nil)
+    }
+
+    private func buildMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let quitTitle = String(format: tr("menu.quit"), tr("app.name"))
+        let quitItem = NSMenuItem(title: quitTitle, action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        quitItem.target = NSApp
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func buildWindow() {
@@ -35,6 +59,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
             backing: .buffered,
             defer: false
         )
+        window.delegate = self
         window.title = tr("app.name")
         window.minSize = NSSize(width: 920, height: 640)
         window.center()
@@ -180,7 +205,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
                 if ok {
                     self.loadDashboard(port: portValue)
                 } else {
-                    self.stopBackend()
+                    self.stopBackend(force: true)
                     self.startButton.isEnabled = true
                     self.setStatus(tr("error.startTimeout"), isError: true)
                 }
@@ -189,7 +214,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
     }
 
     private func startBackend(port: String) throws {
-        stopBackend()
+        stopBackend(force: true)
 
         guard let resources = Bundle.main.resourceURL else {
             throw LauncherError.missingResources
@@ -221,9 +246,15 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDe
         window.contentView = webView
     }
 
-    private func stopBackend() {
+    private func stopBackend(force: Bool = false) {
         if let process = backendProcess, process.isRunning {
             process.terminate()
+            if force {
+                Thread.sleep(forTimeInterval: 0.35)
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+            }
         }
         backendProcess = nil
     }
