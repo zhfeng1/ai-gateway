@@ -19,6 +19,12 @@ def app_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def runtime_data_dir() -> Path:
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "AI Gateway"
+    return app_base_dir() / "data"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AI Gateway locally.")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
@@ -67,8 +73,7 @@ def open_browser_later(url: str) -> None:
 
 def main() -> None:
     args = parse_args()
-    base_dir = app_base_dir()
-    data_dir = base_dir / "data"
+    data_dir = runtime_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("DATABASE_PATH", str(data_dir / "ai_gateway.sqlite3"))

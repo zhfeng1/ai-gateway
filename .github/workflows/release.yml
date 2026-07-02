@@ -20,9 +20,7 @@ jobs:
             artifact_name: ai-gateway-macos
             executable_path: AI Gateway.app/Contents/MacOS/AI Gateway
             archive_name: ai-gateway-macos.zip
-            entry_point: desktop_launcher.py
             app_name: AI Gateway
-            windowed: "--windowed"
           - os: windows-latest
             artifact_name: ai-gateway-windows-x64
             executable_path: ai-gateway.exe
@@ -44,7 +42,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-release.txt
 
-      - name: Build executable
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
         run: >
           pyinstaller
           --clean
@@ -59,6 +58,45 @@ jobs:
           --collect-all httpx
           --collect-all webview
           "${{ matrix.entry_point }}"
+
+      - name: Build macOS backend
+        if: runner.os == 'macOS'
+        run: >
+          pyinstaller
+          --clean
+          --noconfirm
+          --name ai-gateway-backend
+          --collect-all uvicorn
+          --collect-all websockets
+          --collect-all httptools
+          --collect-all watchfiles
+          --collect-all anyio
+          --collect-all httpx
+          launcher.py
+
+      - name: Build macOS app wrapper
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_DIR="dist/AI Gateway.app"
+          mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/backend"
+          xcrun swiftc \
+            -O \
+            -parse-as-library \
+            -framework Cocoa \
+            -framework WebKit \
+            -o "$APP_DIR/Contents/MacOS/AI Gateway" \
+            "macos/AI Gateway/App.swift"
+          cp -R "dist/ai-gateway-backend/." "$APP_DIR/Contents/Resources/backend/"
+          cp "macos/AI Gateway/Info.plist" "$APP_DIR/Contents/Info.plist"
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+([.][0-9]+){0,2}$ ]]; then
+            VERSION="0.1.0"
+          fi
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_DIR/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$APP_DIR/Contents/Info.plist"
+          chmod +x "$APP_DIR/Contents/MacOS/AI Gateway"
+          chmod +x "$APP_DIR/Contents/Resources/backend/ai-gateway-backend"
 
       - name: Prepare package
         shell: bash
