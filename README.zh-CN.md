@@ -47,7 +47,7 @@ http://127.0.0.1:20000/http://123.123.123.123:18088/v1
 ai-gateway-macos.zip
 ```
 
-双击 `AI Gateway.app`，在弹窗中选择端口，应用会自动打开浏览器控制台。
+双击 `AI Gateway.app`，应用会打开一个桌面窗口。先在启动页面选择端口，然后控制台会在同一个窗口中加载。
 
 macOS 本地数据保存位置：
 
@@ -63,24 +63,18 @@ macOS 本地数据保存位置：
 ai-gateway-windows-x64.zip
 ```
 
-双击 `ai-gateway.exe`，或者在 PowerShell 中运行：
+双击 `ai-gateway.exe`，应用会打开一个桌面窗口。先在启动页面选择端口，然后控制台会在同一个窗口中加载。
+
+也可以在 PowerShell 中运行：
 
 ```powershell
 .\ai-gateway.exe
 ```
 
-启动时输入端口，直接回车默认使用 `20000`。
-
 Windows 本地数据保存在可执行文件旁边：
 
 ```text
 data\ai_gateway.sqlite3
-```
-
-也可以直接指定端口：
-
-```powershell
-.\ai-gateway.exe --port 20000
 ```
 
 ## GitHub Actions

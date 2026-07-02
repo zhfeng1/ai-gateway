@@ -20,16 +20,16 @@ jobs:
             artifact_name: ai-gateway-macos
             executable_path: AI Gateway.app/Contents/MacOS/AI Gateway
             archive_name: ai-gateway-macos.zip
-            entry_point: mac_launcher.py
+            entry_point: desktop_launcher.py
             app_name: AI Gateway
             windowed: "--windowed"
           - os: windows-latest
             artifact_name: ai-gateway-windows-x64
             executable_path: ai-gateway.exe
             archive_name: ai-gateway-windows-x64.zip
-            entry_point: launcher.py
+            entry_point: desktop_launcher.py
             app_name: ai-gateway
-            windowed: ""
+            windowed: "--windowed"
 
     steps:
       - name: Checkout
@@ -57,6 +57,7 @@ jobs:
           --collect-all watchfiles
           --collect-all anyio
           --collect-all httpx
+          --collect-all webview
           "${{ matrix.entry_point }}"
 
       - name: Prepare package

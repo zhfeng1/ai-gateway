@@ -27,18 +27,14 @@ Paths, query strings, request headers, request body, response headers, response 
 
 ### Local Release Package
 
-GitHub Releases include macOS and Windows packages built by GitHub Actions.
+GitHub Releases include macOS and Windows desktop packages built by GitHub Actions.
 
-On macOS, double-click `AI Gateway.app`, choose a port in the dialog, and the dashboard opens in the browser.
+On macOS, double-click `AI Gateway.app`. On Windows, double-click `ai-gateway.exe`.
+
+Both versions open a desktop window. Choose a port in the startup screen, then the gateway dashboard loads inside the same app window.
 
 ```powershell
 .\ai-gateway.exe
-```
-
-You can also pass a port directly:
-
-```bash
-./ai-gateway --port 20000
 ```
 
 The Windows package stores logs in `data/ai_gateway.sqlite3` next to the executable. The macOS app stores logs in `~/Library/Application Support/AI Gateway/ai_gateway.sqlite3`.
