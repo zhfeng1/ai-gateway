@@ -73,13 +73,14 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func buildWindow() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 860),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.delegate = self
         window.title = tr("app.name")
-        window.minSize = NSSize(width: 920, height: 640)
+        window.minSize = NSSize(width: 1280, height: 860)
+        window.maxSize = NSSize(width: 1280, height: 860)
         window.center()
 
         toolbar = NSToolbar(identifier: "mainToolbar")

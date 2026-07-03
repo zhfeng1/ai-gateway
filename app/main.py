@@ -335,16 +335,21 @@ async def dashboard() -> str:
       --radius: 10px;
     }
     * { box-sizing: border-box; }
-    html { background: var(--bg); }
+    html {
+      height: 100%;
+      background: var(--bg);
+      overflow: hidden;
+    }
     body {
       margin: 0;
+      height: 100%;
       background:
         radial-gradient(circle at 18% 0%, rgba(53, 183, 255, .12), transparent 32%),
         radial-gradient(circle at 78% 0%, rgba(39, 209, 127, .10), transparent 30%),
         var(--bg);
       color: var(--text);
       font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      overflow-x: hidden;
+      overflow: hidden;
       -webkit-tap-highlight-color: rgba(39, 209, 127, .18);
     }
     a, button, input { touch-action: manipulation; }
@@ -360,9 +365,10 @@ async def dashboard() -> str:
     }
     .skip-link:focus-visible { top: 10px; outline: 3px solid #7dd3fc; outline-offset: 2px; }
     .shell {
-      min-height: 100dvh;
+      height: 100dvh;
       display: grid;
       grid-template-rows: auto 1fr;
+      overflow: hidden;
     }
     header.app-header {
       display: flex;
@@ -373,8 +379,6 @@ async def dashboard() -> str:
       border-bottom: 1px solid var(--line);
       background: rgba(16, 21, 31, .9);
       backdrop-filter: blur(14px);
-      position: sticky;
-      top: 0;
       z-index: 3;
     }
     h1 {
@@ -462,14 +466,18 @@ async def dashboard() -> str:
     main {
       display: grid;
       grid-template-columns: minmax(380px, 34%) minmax(0, 1fr);
-      min-height: calc(100dvh - 69px);
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
     }
     .sidebar {
       border-right: 1px solid var(--line);
       background: rgba(10, 14, 21, .78);
       min-width: 0;
+      min-height: 0;
       display: grid;
       grid-template-rows: auto 1fr;
+      overflow: hidden;
     }
     .filters {
       display: grid;
@@ -522,7 +530,7 @@ async def dashboard() -> str:
     }
     .list {
       overflow: auto;
-      max-height: calc(100dvh - 190px);
+      min-height: 0;
       padding: 8px;
     }
     .item {
@@ -589,7 +597,8 @@ async def dashboard() -> str:
     .detail {
       padding: 18px;
       overflow: auto;
-      max-height: calc(100dvh - 69px);
+      height: 100%;
+      min-height: 0;
       min-width: 0;
     }
     .empty {
@@ -833,7 +842,7 @@ async def dashboard() -> str:
       .toolbar { width: 100%; justify-content: space-between; }
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
       .list { max-height: 42vh; }
-      .detail { max-height: none; }
+      .detail { height: 100%; }
       .title-row { flex-direction: column; }
       .kv-row { grid-template-columns: 1fr; }
       .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
