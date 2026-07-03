@@ -7,23 +7,6 @@ private func tr(_ key: String) -> String {
     NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
 }
 
-final class CenteredTextFieldCell: NSTextFieldCell {
-    override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        let baseRect = super.drawingRect(forBounds: rect)
-        let textSize = cellSize(forBounds: rect)
-        let offset = max(0, (rect.height - textSize.height) / 2)
-        return baseRect.insetBy(dx: 0, dy: offset)
-    }
-
-    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: drawingRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
-    }
-
-    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
-        super.select(withFrame: drawingRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
-    }
-}
-
 final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -87,8 +70,6 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         toolbar.delegate = self
         toolbar.displayMode = .iconAndLabel
         toolbar.allowsUserCustomization = false
-        toolbar.isVisible = false
-        window.toolbar = toolbar
 
         webView = WKWebView(frame: .zero)
         webView.navigationDelegate = self
@@ -175,14 +156,18 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         panel.addSubview(label)
 
         portField = NSTextField(string: defaultPort)
-        portField.cell = CenteredTextFieldCell(textCell: defaultPort)
         portField.translatesAutoresizingMaskIntoConstraints = false
         portField.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         portField.alignment = .center
+        portField.textColor = NSColor(red: 0.89, green: 0.925, blue: 0.98, alpha: 1)
+        portField.isEditable = true
+        portField.isSelectable = true
         portField.focusRingType = .none
-        portField.isBezeled = false
+        portField.isBezeled = true
+        portField.bezelStyle = .roundedBezel
+        portField.drawsBackground = true
+        portField.backgroundColor = NSColor(red: 0.018, green: 0.027, blue: 0.043, alpha: 1)
         portField.wantsLayer = true
-        portField.layer?.backgroundColor = NSColor(red: 0.018, green: 0.027, blue: 0.043, alpha: 1).cgColor
         portField.layer?.cornerRadius = 10
         portField.layer?.borderWidth = 1
         portField.layer?.borderColor = NSColor(red: 0.145, green: 0.188, blue: 0.267, alpha: 1).cgColor
@@ -209,7 +194,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
 
         NSLayoutConstraint.activate([
             panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-            panel.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            panel.centerYAnchor.constraint(equalTo: root.centerYAnchor, constant: 18),
             panel.widthAnchor.constraint(equalToConstant: 560),
 
             mark.topAnchor.constraint(equalTo: panel.topAnchor, constant: 34),
@@ -336,6 +321,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         webView.autoresizingMask = [.width, .height]
         webView.load(URLRequest(url: url))
         window.contentView = webView
+        window.toolbar = toolbar
         toolbar.isVisible = true
         window.title = "\(tr("app.name")) · \(port)"
     }
@@ -347,6 +333,7 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startButton.isEnabled = true
         statusLabel.stringValue = ""
         toolbar.isVisible = false
+        window.toolbar = nil
         window.title = tr("app.name")
         window.contentView = startView
         DispatchQueue.main.async { self.window.makeFirstResponder(self.portField) }
