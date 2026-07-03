@@ -1,7 +1,11 @@
 "app.name" = "AI 网关";
 "start.subtitle" = "选择本地端口后，将在此窗口内打开网关控制台。";
+"start.badge" = "本地模式";
+"start.hintTitle" = "控制台地址";
 "start.port" = "启动端口";
 "start.button" = "启动";
+"stop.button" = "停止";
+"stop.tooltip" = "停止网关服务并返回端口输入页";
 "menu.quit" = "退出 %@";
 "status.starting" = "启动中...";
 "error.invalidPort" = "请输入有效的数字端口。";

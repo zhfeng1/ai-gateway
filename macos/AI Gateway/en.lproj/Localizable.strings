@@ -1,7 +1,11 @@
 "app.name" = "AI Gateway";
 "start.subtitle" = "Choose a local port, then the gateway dashboard opens in this window.";
+"start.badge" = "Local mode";
+"start.hintTitle" = "Dashboard";
 "start.port" = "Port";
 "start.button" = "Start";
+"stop.button" = "Stop";
+"stop.tooltip" = "Stop the gateway service and return to port setup";
 "menu.quit" = "Quit %@";
 "status.starting" = "Starting...";
 "error.invalidPort" = "Enter a valid numeric port.";
