@@ -1237,7 +1237,7 @@ async def dashboard() -> str:
         const isArray = Array.isArray(value);
         const entries = isArray ? value.map((item, index) => [String(index), item]) : Object.entries(value);
         return `
-          <details class="json-node" ${depth === 0 ? 'open' : ''}>
+          <details class="json-node" open>
             <summary>${keyHtml}<span class="json-type">${isArray ? 'Array' : 'Object'}</span><span class="json-preview">${esc(jsonSummary(value))}</span></summary>
             <div class="json-children">
               ${entries.length ? entries.map(([childKey, childValue]) => renderJsonValue(childValue, childKey, depth + 1)).join('') : '<div class="json-leaf json-preview">(empty)</div>'}
