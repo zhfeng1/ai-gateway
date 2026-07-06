@@ -265,6 +265,65 @@ def reasoning_tokens_from_body(body: bytes) -> int | None:
     return find_reasoning_tokens(parse_completed_response_from_sse(body))
 
 
+def api_type_from_payload(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = str(payload.get("type") or "").lower()
+    object_type = str(payload.get("object") or "").lower()
+    if payload_type.startswith("response") or payload.get("response"):
+        return "responses"
+    if object_type.startswith("chat.completion") or isinstance(payload.get("choices"), list):
+        return "chat_completions"
+    if payload_type.startswith("message") or object_type.startswith("message") or payload.get("message"):
+        return "messages"
+    return None
+
+
+def api_type_from_body(body: bytes) -> str | None:
+    direct = api_type_from_payload(parse_json_bytes(body))
+    if direct:
+        return direct
+    completed = api_type_from_payload(parse_completed_response_from_sse(body))
+    if completed:
+        return completed
+
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    events = parse_sse_events(text)
+    if any(item["event"] == "response.completed" for item in events):
+        return "responses"
+
+    parsed_events = []
+    for item in events:
+        if item["data"] == "[DONE]":
+            continue
+        try:
+            parsed_events.append(json.loads(item["data"]))
+        except json.JSONDecodeError:
+            pass
+    for payload in parsed_events:
+        detected = api_type_from_payload(payload)
+        if detected:
+            return detected
+    if any(item["event"].startswith("message_") or item["event"].startswith("content_block_") for item in events):
+        return "messages"
+    return None
+
+
+def api_type_from_log(target_url: str, request_body: bytes, response_body: bytes) -> str:
+    normalized_url = target_url.lower()
+    if "/chat/completions" in normalized_url:
+        return "chat_completions"
+    if "/responses" in normalized_url:
+        return "responses"
+    if "/messages" in normalized_url:
+        return "messages"
+    return api_type_from_body(response_body) or api_type_from_body(request_body) or "other"
+
+
 def append_capture(existing: bytearray, chunk: bytes) -> bool:
     if MAX_CAPTURE_BYTES <= 0:
         existing.extend(chunk)
@@ -317,6 +376,11 @@ def row_to_summary(row: sqlite3.Row) -> dict:
         "request_body_bytes": len(row["request_body"] or b""),
         "response_body_bytes": len(row["response_body"] or b""),
         "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
+        "api_type": api_type_from_log(
+            row["target_url"] or "",
+            row["request_body"] or b"",
+            row["response_body"] or b"",
+        ),
         "request_body_truncated": bool(row["request_body_truncated"]),
         "response_body_truncated": bool(row["response_body_truncated"]),
     }
@@ -582,6 +646,42 @@ async def dashboard() -> str:
       padding: 0 12px;
       font: inherit;
     }
+    .type-filter {
+      display: grid;
+      gap: 6px;
+    }
+    .type-filter-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .type-filter-options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--code-bg);
+    }
+    .type-filter-options button {
+      min-height: 34px;
+      height: 34px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .type-filter-options button.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: inset 0 0 0 1px rgba(39, 209, 127, .22);
+    }
     .summary-strip {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -668,6 +768,11 @@ async def dashboard() -> str:
       color: var(--bad);
       border-color: rgba(255, 92, 115, .44);
       background: rgba(255, 92, 115, .10);
+    }
+    .badge.api-type {
+      color: var(--accent-2);
+      border-color: rgba(53, 183, 255, .34);
+      background: rgba(53, 183, 255, .08);
     }
     .url {
       color: var(--text);
@@ -956,6 +1061,15 @@ async def dashboard() -> str:
             搜索请求
             <input id="search" name="gateway-search" type="search" autocomplete="off" placeholder="例如 /v1/chat/completions…" />
           </label>
+          <div class="type-filter" aria-label="接口类型过滤">
+            <div class="type-filter-title">接口类型</div>
+            <div class="type-filter-options" role="group" aria-label="接口类型">
+              <button type="button" data-api-type-filter="all">全部</button>
+              <button type="button" data-api-type-filter="chat_completions">ChatComplations</button>
+              <button type="button" data-api-type-filter="responses">Response</button>
+              <button type="button" data-api-type-filter="messages">Messages</button>
+            </div>
+          </div>
           <div class="summary-strip" aria-label="记录统计">
             <div class="metric"><span>Total</span><strong id="totalCount">0</strong></div>
             <div class="metric"><span>Success</span><strong id="successCount">0</strong></div>
@@ -973,6 +1087,7 @@ async def dashboard() -> str:
     const listEl = document.getElementById('list');
     const detailEl = document.getElementById('detail');
     const searchEl = document.getElementById('search');
+    const typeFilterButtons = Array.from(document.querySelectorAll('[data-api-type-filter]'));
     const liveTextEl = document.getElementById('liveText');
     const totalCountEl = document.getElementById('totalCount');
     const successCountEl = document.getElementById('successCount');
@@ -987,6 +1102,7 @@ async def dashboard() -> str:
     let rowsCache = [];
     let activeResponseBodyView = 'json';
     let activeDetailPending = false;
+    let activeApiTypeFilter = 'all';
     let logSocket = null;
     let reconnectTimer = null;
 
@@ -1022,6 +1138,15 @@ async def dashboard() -> str:
 
     function formatNumberValue(value) {
       return value === null || value === undefined ? '-' : numberFormatter.format(value);
+    }
+
+    function apiTypeLabel(value) {
+      return {
+        chat_completions: 'ChatComplations',
+        responses: 'Response',
+        messages: 'Messages',
+        other: 'Other',
+      }[value] || 'Other';
     }
 
     function gatewayOverhead(row) {
@@ -1213,6 +1338,8 @@ async def dashboard() -> str:
       const params = new URLSearchParams(window.location.search);
       if (activeId) params.set('id', String(activeId));
       params.set('tab', activeTab);
+      if (activeApiTypeFilter && activeApiTypeFilter !== 'all') params.set('type', activeApiTypeFilter);
+      else params.delete('type');
       const q = searchEl.value.trim();
       if (q) params.set('q', q);
       else params.delete('q');
@@ -1222,9 +1349,18 @@ async def dashboard() -> str:
 
     function filteredRows() {
       const q = searchEl.value.trim().toLowerCase();
-      if (!q) return rowsCache;
       return rowsCache.filter(row => {
-        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''}`.toLowerCase().includes(q);
+        if (activeApiTypeFilter !== 'all' && row.api_type !== activeApiTypeFilter) return false;
+        if (!q) return true;
+        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)}`.toLowerCase().includes(q);
+      });
+    }
+
+    function renderTypeFilters() {
+      typeFilterButtons.forEach(button => {
+        const isActive = button.dataset.apiTypeFilter === activeApiTypeFilter;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', String(isActive));
       });
     }
 
@@ -1235,6 +1371,7 @@ async def dashboard() -> str:
       totalCountEl.textContent = numberFormatter.format(rows.length);
       successCountEl.textContent = numberFormatter.format(success);
       errorCountEl.textContent = numberFormatter.format(errors);
+      renderTypeFilters();
 
       if (!rows.length) {
         listEl.innerHTML = '<div class="empty">没有匹配的请求记录</div>';
@@ -1247,6 +1384,7 @@ async def dashboard() -> str:
           <div class="meta">
             <span class="method" translate="no">${esc(row.method)}</span>
             <span class="badge status ${statusClass(row.response_status)}">${esc(statusLabel(row))}</span>
+            <span class="badge api-type">${esc(apiTypeLabel(row.api_type))}</span>
             ${row.reasoning_tokens === 516 ? '<span class="badge anomaly" title="reasoning_tokens 异常">516</span>' : ''}
             <span class="grow"></span>
             <span>${esc(formatMs(row.duration_ms))}</span>
@@ -1362,6 +1500,7 @@ async def dashboard() -> str:
       const responseHeaderText = formatHeaderText(row.response_headers);
       const overheadMs = gatewayOverhead(row);
       const reasoningTokens = row.reasoning_tokens;
+      const apiType = row.api_type || 'other';
       activeResponseBodyView = responseIsSse && ['json', 'sse'].includes(activeResponseBodyView) ? activeResponseBodyView : (responseIsSse ? 'json' : 'body');
       renderList();
       detailEl.innerHTML = `
@@ -1372,6 +1511,7 @@ async def dashboard() -> str:
           </div>
           <div class="facts">
             <div class="fact"><div class="label">Method</div><strong translate="no">${esc(row.method)}</strong></div>
+            <div class="fact"><div class="label">接口类型</div><strong>${esc(apiTypeLabel(apiType))}</strong></div>
             <div class="fact"><div class="label">Status</div><strong>${esc(row.response_status ?? row.error ?? 'pending')}</strong></div>
             <div class="fact"><div class="label">本项目耗时</div><strong>${esc(formatMs(row.duration_ms))}</strong></div>
             <div class="fact"><div class="label">上游接口耗时</div><strong>${esc(formatMs(row.upstream_duration_ms))}</strong></div>
@@ -1452,9 +1592,20 @@ async def dashboard() -> str:
 
     const initialParams = new URLSearchParams(window.location.search);
     searchEl.value = initialParams.get('q') || '';
+    activeApiTypeFilter = initialParams.get('type') || 'all';
+    if (!['all', 'chat_completions', 'responses', 'messages'].includes(activeApiTypeFilter)) {
+      activeApiTypeFilter = 'all';
+    }
     searchEl.addEventListener('input', () => {
       renderList();
       updateUrlState();
+    });
+    typeFilterButtons.forEach(button => {
+      button.addEventListener('click', () => {
+        activeApiTypeFilter = button.dataset.apiTypeFilter || 'all';
+        renderList();
+        updateUrlState();
+      });
     });
     document.getElementById('refresh').addEventListener('click', () => loadList({ refreshDetail: true }));
     loadList({ refreshDetail: true });
@@ -1510,6 +1661,11 @@ async def api_log_detail(log_id: int) -> JSONResponse:
             "response_body": body_payload(row["response_body"] or b""),
             "response_body_truncated": bool(row["response_body_truncated"]),
             "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
+            "api_type": api_type_from_log(
+                row["target_url"] or "",
+                row["request_body"] or b"",
+                row["response_body"] or b"",
+            ),
             "error": row["error"],
             "duration_ms": row["duration_ms"],
             "upstream_duration_ms": row["upstream_duration_ms"],
