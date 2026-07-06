@@ -657,7 +657,7 @@ async def dashboard() -> str:
     }
     .type-filter-options {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px;
       padding: 4px;
       border: 1px solid var(--line);
@@ -1064,7 +1064,6 @@ async def dashboard() -> str:
           <div class="type-filter" aria-label="接口类型过滤">
             <div class="type-filter-title">接口类型</div>
             <div class="type-filter-options" role="group" aria-label="接口类型">
-              <button type="button" data-api-type-filter="all">全部</button>
               <button type="button" data-api-type-filter="chat_completions">ChatComplations</button>
               <button type="button" data-api-type-filter="responses">Response</button>
               <button type="button" data-api-type-filter="messages">Messages</button>
@@ -1102,7 +1101,7 @@ async def dashboard() -> str:
     let rowsCache = [];
     let activeResponseBodyView = 'json';
     let activeDetailPending = false;
-    let activeApiTypeFilter = 'all';
+    let activeApiTypeFilter = '';
     let logSocket = null;
     let reconnectTimer = null;
 
@@ -1338,7 +1337,7 @@ async def dashboard() -> str:
       const params = new URLSearchParams(window.location.search);
       if (activeId) params.set('id', String(activeId));
       params.set('tab', activeTab);
-      if (activeApiTypeFilter && activeApiTypeFilter !== 'all') params.set('type', activeApiTypeFilter);
+      if (activeApiTypeFilter) params.set('type', activeApiTypeFilter);
       else params.delete('type');
       const q = searchEl.value.trim();
       if (q) params.set('q', q);
@@ -1350,7 +1349,7 @@ async def dashboard() -> str:
     function filteredRows() {
       const q = searchEl.value.trim().toLowerCase();
       return rowsCache.filter(row => {
-        if (activeApiTypeFilter !== 'all' && row.api_type !== activeApiTypeFilter) return false;
+        if (activeApiTypeFilter && row.api_type !== activeApiTypeFilter) return false;
         if (!q) return true;
         return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)}`.toLowerCase().includes(q);
       });
@@ -1592,9 +1591,9 @@ async def dashboard() -> str:
 
     const initialParams = new URLSearchParams(window.location.search);
     searchEl.value = initialParams.get('q') || '';
-    activeApiTypeFilter = initialParams.get('type') || 'all';
-    if (!['all', 'chat_completions', 'responses', 'messages'].includes(activeApiTypeFilter)) {
-      activeApiTypeFilter = 'all';
+    activeApiTypeFilter = initialParams.get('type') || '';
+    if (!['', 'chat_completions', 'responses', 'messages'].includes(activeApiTypeFilter)) {
+      activeApiTypeFilter = '';
     }
     searchEl.addEventListener('input', () => {
       renderList();
@@ -1602,7 +1601,8 @@ async def dashboard() -> str:
     });
     typeFilterButtons.forEach(button => {
       button.addEventListener('click', () => {
-        activeApiTypeFilter = button.dataset.apiTypeFilter || 'all';
+        const nextType = button.dataset.apiTypeFilter || '';
+        activeApiTypeFilter = activeApiTypeFilter === nextType ? '' : nextType;
         renderList();
         updateUrlState();
       });
