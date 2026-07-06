@@ -187,6 +187,84 @@ def capture_bytes(data: bytes) -> tuple[bytes, bool]:
     return data[:MAX_CAPTURE_BYTES], True
 
 
+def parse_json_bytes(body: bytes) -> object | None:
+    if not body:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def parse_sse_events(text: str) -> list[dict[str, str]]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    events: list[dict[str, str]] = []
+    for block in text.split("\n\n"):
+        event_name = ""
+        data_lines = []
+        for raw_line in block.splitlines():
+            line = raw_line.rstrip()
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if data_lines:
+            events.append({"event": event_name or "message", "data": "\n".join(data_lines)})
+    return events
+
+
+def parse_completed_response_from_sse(body: bytes) -> object | None:
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for item in reversed(parse_sse_events(text)):
+        if item["event"] == "response.completed":
+            try:
+                return json.loads(item["data"])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def find_reasoning_tokens(payload: object) -> int | None:
+    if isinstance(payload, dict):
+        for path in (
+            ("usage", "output_tokens_details", "reasoning_tokens"),
+            ("usage", "completion_tokens_details", "reasoning_tokens"),
+            ("response", "usage", "output_tokens_details", "reasoning_tokens"),
+            ("response", "usage", "completion_tokens_details", "reasoning_tokens"),
+        ):
+            current: object = payload
+            for key in path:
+                if not isinstance(current, dict) or key not in current:
+                    break
+                current = current[key]
+            else:
+                if isinstance(current, int):
+                    return current
+                if isinstance(current, str) and current.isdigit():
+                    return int(current)
+
+        for value in payload.values():
+            found = find_reasoning_tokens(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_reasoning_tokens(item)
+            if found is not None:
+                return found
+    return None
+
+
+def reasoning_tokens_from_body(body: bytes) -> int | None:
+    direct = find_reasoning_tokens(parse_json_bytes(body))
+    if direct is not None:
+        return direct
+    return find_reasoning_tokens(parse_completed_response_from_sse(body))
+
+
 def append_capture(existing: bytearray, chunk: bytes) -> bool:
     if MAX_CAPTURE_BYTES <= 0:
         existing.extend(chunk)
@@ -238,6 +316,7 @@ def row_to_summary(row: sqlite3.Row) -> dict:
         "error": row["error"],
         "request_body_bytes": len(row["request_body"] or b""),
         "response_body_bytes": len(row["response_body"] or b""),
+        "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
         "request_body_truncated": bool(row["request_body_truncated"]),
         "response_body_truncated": bool(row["response_body_truncated"]),
     }
@@ -585,6 +664,11 @@ async def dashboard() -> str:
     .status.ok { color: var(--good); border-color: rgba(21, 128, 61, .3); }
     .status.err { color: var(--bad); border-color: rgba(185, 28, 28, .3); }
     .status.warn { color: var(--warn); border-color: rgba(180, 83, 9, .3); }
+    .badge.anomaly {
+      color: var(--bad);
+      border-color: rgba(255, 92, 115, .44);
+      background: rgba(255, 92, 115, .10);
+    }
     .url {
       color: var(--text);
       white-space: nowrap;
@@ -936,6 +1020,10 @@ async def dashboard() -> str:
       return value === null || value === undefined ? '-' : `${numberFormatter.format(value)} ms`;
     }
 
+    function formatNumberValue(value) {
+      return value === null || value === undefined ? '-' : numberFormatter.format(value);
+    }
+
     function gatewayOverhead(row) {
       if (row.gateway_overhead_ms !== undefined && row.gateway_overhead_ms !== null) return row.gateway_overhead_ms;
       if (row.duration_ms === null || row.duration_ms === undefined) return null;
@@ -1159,6 +1247,7 @@ async def dashboard() -> str:
           <div class="meta">
             <span class="method" translate="no">${esc(row.method)}</span>
             <span class="badge status ${statusClass(row.response_status)}">${esc(statusLabel(row))}</span>
+            ${row.reasoning_tokens === 516 ? '<span class="badge anomaly" title="reasoning_tokens 异常">516</span>' : ''}
             <span class="grow"></span>
             <span>${esc(formatMs(row.duration_ms))}</span>
           </div>
@@ -1272,6 +1361,7 @@ async def dashboard() -> str:
       const requestHeaderText = formatHeaderText(row.request_headers);
       const responseHeaderText = formatHeaderText(row.response_headers);
       const overheadMs = gatewayOverhead(row);
+      const reasoningTokens = row.reasoning_tokens;
       activeResponseBodyView = responseIsSse && ['json', 'sse'].includes(activeResponseBodyView) ? activeResponseBodyView : (responseIsSse ? 'json' : 'body');
       renderList();
       detailEl.innerHTML = `
@@ -1286,6 +1376,7 @@ async def dashboard() -> str:
             <div class="fact"><div class="label">本项目耗时</div><strong>${esc(formatMs(row.duration_ms))}</strong></div>
             <div class="fact"><div class="label">上游接口耗时</div><strong>${esc(formatMs(row.upstream_duration_ms))}</strong></div>
             <div class="fact"><div class="label">差值</div><strong>${esc(formatMs(overheadMs))}</strong></div>
+            <div class="fact"><div class="label">Reasoning Tokens</div><strong>${esc(formatNumberValue(reasoningTokens))}</strong></div>
             <div class="fact"><div class="label">Request Body</div><strong>${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</strong></div>
             <div class="fact"><div class="label">Response Body</div><strong>${esc(formatBytes(row.response_body.text.length))}${row.response_body_truncated ? ' · truncated' : ''}</strong></div>
             <div class="fact"><div class="label">Created</div><strong>${esc(formatDate(row.created_at))}</strong></div>
@@ -1418,6 +1509,7 @@ async def api_log_detail(log_id: int) -> JSONResponse:
             "response_headers": json.loads(row["response_headers"] or "{}"),
             "response_body": body_payload(row["response_body"] or b""),
             "response_body_truncated": bool(row["response_body_truncated"]),
+            "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
             "error": row["error"],
             "duration_ms": row["duration_ms"],
             "upstream_duration_ms": row["upstream_duration_ms"],
