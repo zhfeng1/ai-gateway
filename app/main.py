@@ -543,13 +543,16 @@ async def dashboard() -> str:
       border-radius: 9px;
       display: grid;
       place-items: center;
-      background: #0b2017;
-      border: 1px solid rgba(39, 209, 127, .42);
-      color: var(--accent);
-      box-shadow: 0 0 24px rgba(39, 209, 127, .16);
-      font-weight: 800;
-      font-variant-numeric: tabular-nums;
+      background: linear-gradient(145deg, rgba(8, 13, 22, .98), rgba(5, 31, 22, .96));
+      border: 1px solid rgba(39, 209, 127, .38);
+      box-shadow: 0 0 24px rgba(39, 209, 127, .18), inset 0 1px 0 rgba(255, 255, 255, .08);
       flex: 0 0 auto;
+      overflow: hidden;
+    }
+    .mark svg {
+      width: 32px;
+      height: 32px;
+      display: block;
     }
     .subtitle {
       color: var(--muted);
@@ -1072,7 +1075,28 @@ async def dashboard() -> str:
   <div class="shell">
     <header class="app-header">
       <div class="brand">
-        <div class="mark" aria-hidden="true">AI</div>
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 64 64" role="img">
+            <defs>
+              <linearGradient id="logoFlow" x1="12" y1="10" x2="52" y2="54" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#35B7FF"/>
+                <stop offset=".48" stop-color="#27D17F"/>
+                <stop offset="1" stop-color="#A7F3D0"/>
+              </linearGradient>
+              <radialGradient id="logoGlow" cx="32" cy="32" r="30" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#27D17F" stop-opacity=".28"/>
+                <stop offset="1" stop-color="#27D17F" stop-opacity="0"/>
+              </radialGradient>
+            </defs>
+            <rect width="64" height="64" rx="16" fill="#071017"/>
+            <circle cx="32" cy="32" r="29" fill="url(#logoGlow)"/>
+            <path d="M15 32c5.8-8.7 11.4-13 17-13s11.2 4.3 17 13c-5.8 8.7-11.4 13-17 13s-11.2-4.3-17-13Z" fill="none" stroke="url(#logoFlow)" stroke-width="4" stroke-linejoin="round"/>
+            <path d="M22 42V25.5c0-2.5 3.2-3.6 4.8-1.7l15 18.2V22" fill="none" stroke="#F4F7FB" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="15" cy="32" r="4" fill="#35B7FF"/>
+            <circle cx="49" cy="32" r="4" fill="#27D17F"/>
+            <circle cx="32" cy="19" r="3.5" fill="#A7F3D0"/>
+          </svg>
+        </div>
         <div>
           <h1 translate="no">AI Gateway</h1>
           <div class="subtitle">Realtime proxy inspector</div>

@@ -7,6 +7,71 @@ private func tr(_ key: String) -> String {
     NSLocalizedString(key, tableName: nil, bundle: .main, value: key, comment: "")
 }
 
+final class LogoMarkView: NSView {
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 52, height: 52)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let bounds = self.bounds.insetBy(dx: 1, dy: 1)
+        let rounded = NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12)
+        NSColor(red: 0.027, green: 0.063, blue: 0.09, alpha: 1).setFill()
+        rounded.fill()
+        NSColor(red: 0.153, green: 0.82, blue: 0.498, alpha: 0.42).setStroke()
+        rounded.lineWidth = 1
+        rounded.stroke()
+
+        NSGraphicsContext.saveGraphicsState()
+        rounded.addClip()
+        let glow = NSGradient(colors: [
+            NSColor(red: 0.153, green: 0.82, blue: 0.498, alpha: 0.26),
+            NSColor(red: 0.02, green: 0.07, blue: 0.10, alpha: 0.0),
+        ])
+        glow?.draw(fromCenter: NSPoint(x: bounds.midX, y: bounds.midY), radius: 0, toCenter: NSPoint(x: bounds.midX, y: bounds.midY), radius: 35, options: [])
+        NSGraphicsContext.restoreGraphicsState()
+
+        let scaleX = bounds.width / 64
+        let scaleY = bounds.height / 64
+        func point(_ x: CGFloat, _ y: CGFloat) -> NSPoint {
+            NSPoint(x: bounds.minX + x * scaleX, y: bounds.minY + y * scaleY)
+        }
+
+        let eye = NSBezierPath()
+        eye.move(to: point(15, 32))
+        eye.curve(to: point(32, 45), controlPoint1: point(21, 41), controlPoint2: point(26, 45))
+        eye.curve(to: point(49, 32), controlPoint1: point(38, 45), controlPoint2: point(43, 41))
+        eye.curve(to: point(32, 19), controlPoint1: point(43, 23), controlPoint2: point(38, 19))
+        eye.curve(to: point(15, 32), controlPoint1: point(26, 19), controlPoint2: point(21, 23))
+        NSColor(red: 0.153, green: 0.82, blue: 0.498, alpha: 1).setStroke()
+        eye.lineWidth = 3.4
+        eye.lineJoinStyle = .round
+        eye.stroke()
+
+        let bridge = NSBezierPath()
+        bridge.move(to: point(22, 42))
+        bridge.line(to: point(22, 25.5))
+        bridge.curve(to: point(26.8, 23.8), controlPoint1: point(22, 23), controlPoint2: point(25.2, 21.9))
+        bridge.line(to: point(41.8, 42))
+        bridge.line(to: point(41.8, 22))
+        NSColor(red: 0.956, green: 0.969, blue: 0.984, alpha: 1).setStroke()
+        bridge.lineWidth = 3.8
+        bridge.lineCapStyle = .round
+        bridge.lineJoinStyle = .round
+        bridge.stroke()
+
+        for (x, y, color) in [
+            (15.0, 32.0, NSColor(red: 0.208, green: 0.718, blue: 1.0, alpha: 1)),
+            (49.0, 32.0, NSColor(red: 0.153, green: 0.82, blue: 0.498, alpha: 1)),
+            (32.0, 19.0, NSColor(red: 0.655, green: 0.953, blue: 0.816, alpha: 1)),
+        ] {
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: point(x, y).x - 3, y: point(x, y).y - 3, width: 6, height: 6)).fill()
+        }
+    }
+}
+
 final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -94,14 +159,9 @@ final class LauncherAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         panel.layer?.borderColor = NSColor(red: 0.145, green: 0.188, blue: 0.267, alpha: 1).cgColor
         root.addSubview(panel)
 
-        let mark = NSTextField(labelWithString: "AI")
+        let mark = LogoMarkView()
         mark.translatesAutoresizingMaskIntoConstraints = false
-        mark.alignment = .center
-        mark.font = .systemFont(ofSize: 16, weight: .bold)
-        mark.textColor = NSColor(red: 0.153, green: 0.82, blue: 0.498, alpha: 1)
         mark.wantsLayer = true
-        mark.layer?.backgroundColor = NSColor(red: 0.043, green: 0.125, blue: 0.09, alpha: 1).cgColor
-        mark.layer?.cornerRadius = 10
         panel.addSubview(mark)
 
         let title = NSTextField(labelWithString: tr("app.name"))
