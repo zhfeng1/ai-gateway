@@ -837,6 +837,35 @@ async def dashboard() -> str:
       background: rgba(16, 21, 31, .78);
       padding: 14px;
     }
+    details.collapsible-section {
+      margin-bottom: 14px;
+      scroll-margin-top: 84px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(16, 21, 31, .78);
+      padding: 0;
+      overflow: hidden;
+    }
+    details.collapsible-section summary {
+      display: block;
+      cursor: pointer;
+      padding: 14px;
+      list-style: none;
+    }
+    details.collapsible-section summary::-webkit-details-marker { display: none; }
+    details.collapsible-section summary .copy-row { margin-bottom: 0; }
+    details.collapsible-section summary h3::before {
+      content: "▶";
+      display: inline-block;
+      width: 14px;
+      color: #93c5fd;
+      font-size: 10px;
+      margin-right: 6px;
+    }
+    details.collapsible-section[open] summary h3::before { content: "▼"; }
+    .collapsible-content {
+      padding: 0 14px 14px;
+    }
     pre {
       margin: 0;
       padding: 12px;
@@ -1526,20 +1555,20 @@ async def dashboard() -> str:
           <button class="tab" type="button" role="tab" data-tab="response">Response</button>
         </div>
         <div data-panel="request">
-          <section>
-            <div class="copy-row"><h3>Request Header</h3><button type="button" data-copy="requestHeaders">复制 Header</button></div>
-            ${renderHeaders(row.request_headers)}
-          </section>
+          <details class="collapsible-section">
+            <summary><div class="copy-row"><h3>Request Header</h3><button type="button" data-copy="requestHeaders">复制 Header</button></div></summary>
+            <div class="collapsible-content">${renderHeaders(row.request_headers)}</div>
+          </details>
           <section>
             <div class="copy-row"><h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3><button type="button" data-copy="requestBody">复制 Body</button></div>
             ${renderBodyContent(row.request_body.text)}
           </section>
         </div>
         <div data-panel="response" hidden>
-          <section>
-            <div class="copy-row"><h3>Response Header</h3><button type="button" data-copy="responseHeaders">复制 Header</button></div>
-            ${renderHeaders(row.response_headers)}
-          </section>
+          <details class="collapsible-section">
+            <summary><div class="copy-row"><h3>Response Header</h3><button type="button" data-copy="responseHeaders">复制 Header</button></div></summary>
+            <div class="collapsible-content">${renderHeaders(row.response_headers)}</div>
+          </details>
           <section>
             <div class="copy-row">
               <h3>Response Body${row.response_body_truncated ? ' (truncated)' : ''}</h3>
@@ -1573,7 +1602,9 @@ async def dashboard() -> str:
         responseBody: responseIsSse ? (activeResponseBodyView === 'json' ? responseJsonText : responseSseText) : responseJsonText,
       };
       detailEl.querySelectorAll('[data-copy]').forEach(button => {
-        button.addEventListener('click', () => {
+        button.addEventListener('click', event => {
+          event.preventDefault();
+          event.stopPropagation();
           if (button.dataset.copy === 'responseBody' && responseIsSse) {
             copyText(activeResponseBodyView === 'json' ? responseJsonText : responseSseText);
             return;
