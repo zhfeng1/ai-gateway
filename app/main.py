@@ -907,21 +907,154 @@ async def dashboard() -> str:
     }
     .detail-head {
       display: grid;
-      gap: 14px;
+      gap: 13px;
       margin-bottom: 16px;
-      padding: 16px;
-      border: 1px solid var(--line);
+      padding: 14px;
+      border: 1px solid rgba(61, 75, 99, .82);
       border-radius: 14px;
-      background: rgba(16, 21, 31, .88);
-      box-shadow: var(--shadow);
+      background:
+        linear-gradient(180deg, rgba(25, 34, 49, .92), rgba(12, 17, 26, .92)),
+        var(--panel);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, .26), inset 0 1px 0 rgba(255, 255, 255, .04);
     }
-    .title-row {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
+    .detail-topline {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
       gap: 12px;
     }
-    .title-row h2 { flex: 1; min-width: 0; }
+    .endpoint-block {
+      min-width: 0;
+      display: grid;
+      gap: 8px;
+    }
+    .endpoint-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .endpoint-url {
+      min-width: 0;
+      color: var(--text);
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      max-width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 9px;
+      background: rgba(5, 7, 11, .46);
+      color: var(--muted-strong);
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .pill.method-pill {
+      color: var(--accent);
+      border-color: rgba(39, 209, 127, .32);
+      background: rgba(39, 209, 127, .08);
+    }
+    .pill.type-pill {
+      color: var(--accent-2);
+      border-color: rgba(53, 183, 255, .34);
+      background: rgba(53, 183, 255, .08);
+    }
+    .pill.status-pill.ok {
+      color: var(--good);
+      border-color: rgba(51, 209, 122, .34);
+      background: rgba(51, 209, 122, .08);
+    }
+    .pill.status-pill.err {
+      color: var(--bad);
+      border-color: rgba(255, 92, 115, .38);
+      background: rgba(255, 92, 115, .10);
+    }
+    .pill.status-pill.warn {
+      color: var(--warn);
+      border-color: rgba(245, 184, 75, .36);
+      background: rgba(245, 184, 75, .09);
+    }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(108px, 1fr));
+      gap: 8px;
+    }
+    .metric-card {
+      min-width: 0;
+      border: 1px solid rgba(61, 75, 99, .74);
+      border-radius: 10px;
+      background: rgba(5, 7, 11, .38);
+      padding: 10px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+    }
+    .metric-card.primary {
+      border-color: rgba(53, 183, 255, .30);
+      background: linear-gradient(180deg, rgba(53, 183, 255, .105), rgba(5, 7, 11, .36));
+    }
+    .metric-card.good {
+      border-color: rgba(51, 209, 122, .28);
+      background: linear-gradient(180deg, rgba(51, 209, 122, .09), rgba(5, 7, 11, .35));
+    }
+    .metric-card.warn {
+      border-color: rgba(245, 184, 75, .40);
+      background: linear-gradient(180deg, rgba(245, 184, 75, .12), rgba(5, 7, 11, .35));
+    }
+    .metric-card.danger {
+      border-color: rgba(255, 92, 115, .42);
+      background: linear-gradient(180deg, rgba(255, 92, 115, .13), rgba(5, 7, 11, .35));
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      overflow-wrap: anywhere;
+    }
+    .metric-value {
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.2;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .metric-card.primary .metric-value { color: #dff6ff; }
+    .metric-card.good .metric-value { color: #d9fbe7; }
+    .metric-card.warn .metric-value { color: #fff0c7; }
+    .metric-card.danger .metric-value { color: #ffd9df; }
+    .detail-meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding-top: 1px;
+    }
+    .meta-chip {
+      min-width: 0;
+      border: 1px solid rgba(61, 75, 99, .62);
+      border-radius: 10px;
+      background: rgba(5, 7, 11, .28);
+      padding: 8px 10px;
+    }
+    .meta-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 2px;
+    }
+    .meta-value {
+      color: var(--muted-strong);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
     h2 {
       font-size: 18px;
       margin: 0;
@@ -1073,23 +1206,6 @@ async def dashboard() -> str:
       border-right: 1px solid var(--line);
     }
     .kv-value { color: var(--code-text); }
-    .facts {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 8px;
-    }
-    .fact {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(5, 7, 11, .42);
-      padding: 11px;
-      min-width: 0;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
-    }
-    .fact strong {
-      font-variant-numeric: tabular-nums;
-      overflow-wrap: anywhere;
-    }
     .label { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
     .tabs {
       display: flex;
@@ -1168,9 +1284,14 @@ async def dashboard() -> str:
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
       .list { max-height: 42vh; }
       .detail { height: 100%; }
-      .title-row { flex-direction: column; }
+      .detail-topline,
+      .detail-meta { grid-template-columns: 1fr; }
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-row { grid-template-columns: 1fr; }
       .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+    @media (min-width: 821px) and (max-width: 1180px) {
+      .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -1271,6 +1392,10 @@ async def dashboard() -> str:
     function statusClass(status) {
       if (!status) return 'warn';
       return status >= 200 && status < 400 ? 'ok' : 'err';
+    }
+
+    function statusClassForRow(row) {
+      return row.error ? 'err' : statusClass(row.response_status);
     }
 
     function statusLabel(row) {
@@ -1543,7 +1668,7 @@ async def dashboard() -> str:
         <button class="item ${row.id === activeId ? 'active' : ''}" type="button" data-id="${row.id}" aria-current="${row.id === activeId ? 'true' : 'false'}">
           <div class="meta">
             <span class="method" translate="no">${esc(row.method)}</span>
-            <span class="badge status ${statusClass(row.response_status)}">${esc(statusLabel(row))}</span>
+            <span class="badge status ${statusClassForRow(row)}">${esc(statusLabel(row))}</span>
             <span class="badge api-type">${esc(apiTypeLabel(row.api_type))}</span>
             ${row.reasoning_tokens === 516 ? '<span class="badge anomaly" title="reasoning_tokens 异常">516</span>' : ''}
             <span class="grow"></span>
@@ -1661,27 +1786,36 @@ async def dashboard() -> str:
       const overheadMs = gatewayOverhead(row);
       const reasoningTokens = row.reasoning_tokens;
       const apiType = row.api_type || 'other';
+      const isReasoningAnomaly = reasoningTokens === 516;
       activeResponseBodyView = responseIsSse && ['json', 'sse'].includes(activeResponseBodyView) ? activeResponseBodyView : (responseIsSse ? 'json' : 'body');
       renderList();
       detailEl.innerHTML = `
         <div class="detail-head">
-          <div class="title-row">
-            <h2 translate="no">${esc(row.target_url)}</h2>
+          <div class="detail-topline">
+            <div class="endpoint-block">
+              <div class="endpoint-badges">
+                <span class="pill method-pill" translate="no">${esc(row.method)}</span>
+                <span class="pill type-pill">${esc(apiTypeLabel(apiType))}</span>
+                <span class="pill status-pill ${statusClassForRow(row)}">${esc(statusLabel(row))}</span>
+                ${isReasoningAnomaly ? '<span class="pill status-pill err">reasoning 516</span>' : ''}
+              </div>
+              <div class="endpoint-url" translate="no">${esc(row.target_url)}</div>
+            </div>
             <button type="button" data-copy="url">复制 URL</button>
           </div>
-          <div class="facts">
-            <div class="fact"><div class="label">Method</div><strong translate="no">${esc(row.method)}</strong></div>
-            <div class="fact"><div class="label">接口类型</div><strong>${esc(apiTypeLabel(apiType))}</strong></div>
-            <div class="fact"><div class="label">Status</div><strong>${esc(row.response_status ?? row.error ?? 'pending')}</strong></div>
-            <div class="fact"><div class="label">本项目耗时</div><strong>${esc(formatMs(row.duration_ms))}</strong></div>
-            <div class="fact"><div class="label">上游接口耗时</div><strong>${esc(formatMs(row.upstream_duration_ms))}</strong></div>
-            <div class="fact"><div class="label">首字用时</div><strong>${esc(formatMs(row.first_byte_ms))}</strong></div>
-            <div class="fact"><div class="label">TPS</div><strong>${esc(formatTps(row.tps))}</strong></div>
-            <div class="fact"><div class="label">差值</div><strong>${esc(formatMs(overheadMs))}</strong></div>
-            <div class="fact"><div class="label">Reasoning Tokens</div><strong>${esc(formatNumberValue(reasoningTokens))}</strong></div>
-            <div class="fact"><div class="label">Request Body</div><strong>${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</strong></div>
-            <div class="fact"><div class="label">Response Body</div><strong>${esc(formatBytes(row.response_body.text.length))}${row.response_body_truncated ? ' · truncated' : ''}</strong></div>
-            <div class="fact"><div class="label">Created</div><strong>${esc(formatDate(row.created_at))}</strong></div>
+          <div class="metric-grid" aria-label="请求关键指标">
+            <div class="metric-card primary"><div class="metric-label">本项目耗时</div><div class="metric-value">${esc(formatMs(row.duration_ms))}</div></div>
+            <div class="metric-card"><div class="metric-label">上游接口耗时</div><div class="metric-value">${esc(formatMs(row.upstream_duration_ms))}</div></div>
+            <div class="metric-card ${overheadMs !== null && overheadMs > 80 ? 'warn' : 'good'}"><div class="metric-label">差值</div><div class="metric-value">${esc(formatMs(overheadMs))}</div></div>
+            <div class="metric-card primary"><div class="metric-label">首字用时</div><div class="metric-value">${esc(formatMs(row.first_byte_ms))}</div></div>
+            <div class="metric-card good"><div class="metric-label">TPS</div><div class="metric-value">${esc(formatTps(row.tps))}</div></div>
+            <div class="metric-card ${isReasoningAnomaly ? 'danger' : ''}"><div class="metric-label">Reasoning Tokens</div><div class="metric-value">${esc(formatNumberValue(reasoningTokens))}</div></div>
+          </div>
+          <div class="detail-meta">
+            <div class="meta-chip"><span class="meta-label">Output Tokens</span><span class="meta-value">${esc(formatNumberValue(row.output_tokens))}</span></div>
+            <div class="meta-chip"><span class="meta-label">Request Body</span><span class="meta-value">${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</span></div>
+            <div class="meta-chip"><span class="meta-label">Response Body</span><span class="meta-value">${esc(formatBytes(row.response_body.text.length))}${row.response_body_truncated ? ' · truncated' : ''}</span></div>
+            <div class="meta-chip"><span class="meta-label">Created</span><span class="meta-value">${esc(formatDate(row.created_at))}</span></div>
           </div>
         </div>
         <div class="tabs" role="tablist" aria-label="请求详情">
