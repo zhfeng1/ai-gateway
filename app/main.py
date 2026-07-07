@@ -87,13 +87,19 @@ def ensure_db() -> None:
                 response_body_truncated INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 duration_ms INTEGER,
-                upstream_duration_ms INTEGER
+                upstream_duration_ms INTEGER,
+                first_byte_ms INTEGER,
+                output_tokens INTEGER
             )
             """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
         if "upstream_duration_ms" not in columns:
             conn.execute("ALTER TABLE request_logs ADD COLUMN upstream_duration_ms INTEGER")
+        if "first_byte_ms" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN first_byte_ms INTEGER")
+        if "output_tokens" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
 
 
 @app.on_event("startup")
@@ -150,12 +156,17 @@ def finish_log(
     started_at: float,
     upstream_started_at: float | None = None,
     finished_at: float | None = None,
+    first_byte_at: float | None = None,
     error: str | None = None,
 ) -> None:
     finished_at = finished_at or time.perf_counter()
     upstream_duration_ms = None
     if upstream_started_at is not None:
         upstream_duration_ms = int((finished_at - upstream_started_at) * 1000)
+    first_byte_ms = None
+    if first_byte_at is not None:
+        first_byte_ms = int((first_byte_at - started_at) * 1000)
+    response_bytes = bytes(response_body)
     db_execute(
         """
         UPDATE request_logs
@@ -165,17 +176,21 @@ def finish_log(
             response_body_truncated = ?,
             error = ?,
             duration_ms = ?,
-            upstream_duration_ms = ?
+            upstream_duration_ms = ?,
+            first_byte_ms = ?,
+            output_tokens = ?
         WHERE id = ?
         """,
         (
             status_code,
             json.dumps(response_headers or {}, ensure_ascii=False, indent=2),
-            bytes(response_body),
+            response_bytes,
             int(response_body_truncated),
             error,
             int((finished_at - started_at) * 1000),
             upstream_duration_ms,
+            first_byte_ms,
+            output_tokens_from_body(response_bytes),
             log_id,
         ),
     )
@@ -258,11 +273,85 @@ def find_reasoning_tokens(payload: object) -> int | None:
     return None
 
 
+def find_output_tokens(payload: object) -> int | None:
+    if isinstance(payload, dict):
+        for path in (
+            ("usage", "output_tokens"),
+            ("usage", "completion_tokens"),
+            ("usage", "output_token_count"),
+            ("response", "usage", "output_tokens"),
+            ("response", "usage", "completion_tokens"),
+            ("message", "usage", "output_tokens"),
+        ):
+            current: object = payload
+            for key in path:
+                if not isinstance(current, dict) or key not in current:
+                    break
+                current = current[key]
+            else:
+                if isinstance(current, int):
+                    return current
+                if isinstance(current, str) and current.isdigit():
+                    return int(current)
+
+        for value in payload.values():
+            found = find_output_tokens(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_output_tokens(item)
+            if found is not None:
+                return found
+    return None
+
+
 def reasoning_tokens_from_body(body: bytes) -> int | None:
     direct = find_reasoning_tokens(parse_json_bytes(body))
     if direct is not None:
         return direct
-    return find_reasoning_tokens(parse_completed_response_from_sse(body))
+    completed = find_reasoning_tokens(parse_completed_response_from_sse(body))
+    if completed is not None:
+        return completed
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for item in reversed(parse_sse_events(text)):
+        if item["data"] == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(item["data"])
+        except json.JSONDecodeError:
+            continue
+        found = find_reasoning_tokens(parsed)
+        if found is not None:
+            return found
+    return None
+
+
+def output_tokens_from_body(body: bytes) -> int | None:
+    direct = find_output_tokens(parse_json_bytes(body))
+    if direct is not None:
+        return direct
+    completed = find_output_tokens(parse_completed_response_from_sse(body))
+    if completed is not None:
+        return completed
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for item in reversed(parse_sse_events(text)):
+        if item["data"] == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(item["data"])
+        except json.JSONDecodeError:
+            continue
+        found = find_output_tokens(parsed)
+        if found is not None:
+            return found
+    return None
 
 
 def api_type_from_payload(payload: object) -> str | None:
@@ -357,7 +446,19 @@ def validate_target_url(target_url: str) -> str | None:
     return None
 
 
+def tps_from_values(output_tokens: int | None, duration_ms: int | None, first_byte_ms: int | None) -> float | None:
+    if not output_tokens or duration_ms is None:
+        return None
+    generation_ms = duration_ms
+    if first_byte_ms is not None and duration_ms > first_byte_ms:
+        generation_ms = duration_ms - first_byte_ms
+    if generation_ms <= 0:
+        return None
+    return round(output_tokens / (generation_ms / 1000), 2)
+
+
 def row_to_summary(row: sqlite3.Row) -> dict:
+    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(row["response_body"] or b"")
     return {
         "id": row["id"],
         "created_at": row["created_at"],
@@ -367,6 +468,9 @@ def row_to_summary(row: sqlite3.Row) -> dict:
         "response_status": row["response_status"],
         "duration_ms": row["duration_ms"],
         "upstream_duration_ms": row["upstream_duration_ms"],
+        "first_byte_ms": row["first_byte_ms"],
+        "output_tokens": output_tokens,
+        "tps": tps_from_values(output_tokens, row["duration_ms"], row["first_byte_ms"]),
         "gateway_overhead_ms": (
             row["duration_ms"] - row["upstream_duration_ms"]
             if row["duration_ms"] is not None and row["upstream_duration_ms"] is not None
@@ -394,7 +498,7 @@ def list_log_summaries(limit: int = 100) -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, created_at, method, target_url, client_host, response_status,
-                   duration_ms, upstream_duration_ms, error, request_body, response_body,
+                   duration_ms, upstream_duration_ms, first_byte_ms, output_tokens, error, request_body, response_body,
                    request_body_truncated, response_body_truncated
             FROM request_logs
             ORDER BY id DESC
@@ -1192,6 +1296,10 @@ async def dashboard() -> str:
       return value === null || value === undefined ? '-' : numberFormatter.format(value);
     }
 
+    function formatTps(value) {
+      return value === null || value === undefined ? '-' : `${numberFormatter.format(value)} tok/s`;
+    }
+
     function apiTypeLabel(value) {
       return {
         chat_completions: 'ChatComplations',
@@ -1567,6 +1675,8 @@ async def dashboard() -> str:
             <div class="fact"><div class="label">Status</div><strong>${esc(row.response_status ?? row.error ?? 'pending')}</strong></div>
             <div class="fact"><div class="label">本项目耗时</div><strong>${esc(formatMs(row.duration_ms))}</strong></div>
             <div class="fact"><div class="label">上游接口耗时</div><strong>${esc(formatMs(row.upstream_duration_ms))}</strong></div>
+            <div class="fact"><div class="label">首字用时</div><strong>${esc(formatMs(row.first_byte_ms))}</strong></div>
+            <div class="fact"><div class="label">TPS</div><strong>${esc(formatTps(row.tps))}</strong></div>
             <div class="fact"><div class="label">差值</div><strong>${esc(formatMs(overheadMs))}</strong></div>
             <div class="fact"><div class="label">Reasoning Tokens</div><strong>${esc(formatNumberValue(reasoningTokens))}</strong></div>
             <div class="fact"><div class="label">Request Body</div><strong>${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</strong></div>
@@ -1701,6 +1811,7 @@ async def api_log_detail(log_id: int) -> JSONResponse:
     if row is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(row["response_body"] or b"")
     return JSONResponse(
         {
             "id": row["id"],
@@ -1724,6 +1835,9 @@ async def api_log_detail(log_id: int) -> JSONResponse:
             "error": row["error"],
             "duration_ms": row["duration_ms"],
             "upstream_duration_ms": row["upstream_duration_ms"],
+            "first_byte_ms": row["first_byte_ms"],
+            "output_tokens": output_tokens,
+            "tps": tps_from_values(output_tokens, row["duration_ms"], row["first_byte_ms"]),
             "gateway_overhead_ms": (
                 row["duration_ms"] - row["upstream_duration_ms"]
                 if row["duration_ms"] is not None and row["upstream_duration_ms"] is not None
@@ -1786,6 +1900,7 @@ async def proxy(target_url: str, request: Request):
                 started_at,
                 upstream_started_at,
                 finished_at,
+                None,
                 str(exc),
             )
         )
@@ -1795,9 +1910,12 @@ async def proxy(target_url: str, request: Request):
 
     async def stream_response() -> AsyncIterator[bytes]:
         nonlocal response_truncated
+        first_byte_at = None
         error = None
         try:
             async for chunk in upstream_response.aiter_bytes():
+                if first_byte_at is None:
+                    first_byte_at = time.perf_counter()
                 response_truncated = append_capture(response_capture, chunk) or response_truncated
                 yield chunk
         except Exception as exc:
@@ -1817,6 +1935,7 @@ async def proxy(target_url: str, request: Request):
                     started_at,
                     upstream_started_at,
                     finished_at,
+                    first_byte_at,
                     error,
                 )
             )
