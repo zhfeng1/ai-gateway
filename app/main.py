@@ -33,22 +33,25 @@ HOP_BY_HOP_HEADERS = {
 }
 
 app = FastAPI(title="AI Gateway", docs_url=None, redoc_url=None)
+RESERVED_ACCESS_KEYS = {"api", "ws", "health", "docs", "redoc", "openapi.json", "favicon.ico"}
 
 
 class LogSocketManager:
     def __init__(self) -> None:
-        self.connections: set[WebSocket] = set()
+        self.connections: dict[WebSocket, str | None] = {}
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, websocket: WebSocket, access_key: str | None = None) -> None:
         await websocket.accept()
-        self.connections.add(websocket)
+        self.connections[websocket] = access_key
 
     def disconnect(self, websocket: WebSocket) -> None:
-        self.connections.discard(websocket)
+        self.connections.pop(websocket, None)
 
-    async def broadcast(self, payload: dict) -> None:
+    async def broadcast(self, payload: dict, access_key: str | None = None) -> None:
         dead_connections = []
-        for websocket in list(self.connections):
+        for websocket, connection_access_key in list(self.connections.items()):
+            if connection_access_key != access_key:
+                continue
             try:
                 await websocket.send_json(payload)
             except Exception:
@@ -89,7 +92,8 @@ def ensure_db() -> None:
                 duration_ms INTEGER,
                 upstream_duration_ms INTEGER,
                 first_byte_ms INTEGER,
-                output_tokens INTEGER
+                output_tokens INTEGER,
+                access_key TEXT
             )
             """
         )
@@ -100,6 +104,8 @@ def ensure_db() -> None:
             conn.execute("ALTER TABLE request_logs ADD COLUMN first_byte_ms INTEGER")
         if "output_tokens" not in columns:
             conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
+        if "access_key" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN access_key TEXT")
 
 
 @app.on_event("startup")
@@ -122,6 +128,7 @@ def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
 def create_log(
     method: str,
     target_url: str,
+    access_key: str | None,
     client_host: str | None,
     request_headers: dict[str, str],
     request_body: bytes,
@@ -130,14 +137,15 @@ def create_log(
     cur = db_execute(
         """
         INSERT INTO request_logs (
-            created_at, method, target_url, client_host, request_headers,
+            created_at, method, target_url, access_key, client_host, request_headers,
             request_body, request_body_truncated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
             method,
             target_url,
+            access_key,
             client_host,
             json.dumps(request_headers, ensure_ascii=False, indent=2),
             request_body,
@@ -446,6 +454,15 @@ def validate_target_url(target_url: str) -> str | None:
     return None
 
 
+def normalize_access_key(access_key: str | None) -> str | None:
+    if not access_key:
+        return None
+    access_key = access_key.strip("/")
+    if not access_key or access_key in RESERVED_ACCESS_KEYS:
+        return None
+    return access_key
+
+
 def tps_from_values(output_tokens: int | None, duration_ms: int | None, first_byte_ms: int | None) -> float | None:
     if not output_tokens or duration_ms is None:
         return None
@@ -464,6 +481,7 @@ def row_to_summary(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "method": row["method"],
         "target_url": row["target_url"],
+        "access_key": row["access_key"],
         "client_host": row["client_host"],
         "response_status": row["response_status"],
         "duration_ms": row["duration_ms"],
@@ -490,40 +508,52 @@ def row_to_summary(row: sqlite3.Row) -> dict:
     }
 
 
-def list_log_summaries(limit: int = 100) -> list[dict]:
+def log_access_key(log_id: int) -> str | None:
+    ensure_db()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute("SELECT access_key FROM request_logs WHERE id = ?", (log_id,)).fetchone()
+    return row[0] if row else None
+
+
+def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[dict]:
     limit = max(1, min(limit, 500))
+    access_key = normalize_access_key(access_key)
     ensure_db()
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
             SELECT id, created_at, method, target_url, client_host, response_status,
-                   duration_ms, upstream_duration_ms, first_byte_ms, output_tokens, error, request_body, response_body,
+                   access_key, duration_ms, upstream_duration_ms, first_byte_ms, output_tokens, error, request_body, response_body,
                    request_body_truncated, response_body_truncated
             FROM request_logs
+            WHERE (? IS NULL AND access_key IS NULL) OR access_key = ?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (limit,),
+            (access_key, access_key, limit),
         ).fetchall()
     return [row_to_summary(row) for row in rows]
 
 
-async def broadcast_logs(changed_id: int | None = None) -> None:
-    rows = await asyncio.to_thread(list_log_summaries, 50)
+async def broadcast_logs(changed_id: int | None = None, access_key: str | None = None) -> None:
+    access_key = normalize_access_key(access_key)
+    rows = await asyncio.to_thread(list_log_summaries, 50, access_key)
     await log_socket_manager.broadcast(
         {
             "type": "logs",
             "changed_id": changed_id,
             "rows": rows,
-        }
+        },
+        access_key,
     )
 
 
 async def announce_created(log_id_task: asyncio.Task[int]) -> None:
     try:
         log_id = await log_id_task
-        await broadcast_logs(log_id)
+        access_key = await asyncio.to_thread(log_access_key, log_id)
+        await broadcast_logs(log_id, access_key)
     except Exception as exc:
         print(f"Failed to announce log creation: {exc}", flush=True)
 
@@ -532,7 +562,8 @@ async def finish_log_async(log_id_task: asyncio.Task[int], *args) -> None:
     try:
         log_id = await log_id_task
         await asyncio.to_thread(finish_log, log_id, *args)
-        await broadcast_logs(log_id)
+        access_key = await asyncio.to_thread(log_access_key, log_id)
+        await broadcast_logs(log_id, access_key)
     except Exception as exc:
         print(f"Failed to finish log: {exc}", flush=True)
 
@@ -1374,6 +1405,8 @@ async def dashboard() -> str:
     });
     const numberFormatter = new Intl.NumberFormat(navigator.languages);
     const byteFormatter = new Intl.NumberFormat(navigator.languages, { maximumFractionDigits: 1 });
+    const pathAccessKey = decodeURIComponent(window.location.pathname.split('/')[1] || '');
+    const apiBase = pathAccessKey ? `/${encodeURIComponent(pathAccessKey)}` : '';
     let activeId = null;
     let activeTab = 'request';
     let rowsCache = [];
@@ -1885,7 +1918,7 @@ async def dashboard() -> str:
 
     async function loadList({ refreshDetail = true } = {}) {
       liveTextEl.textContent = '正在加载…';
-      const res = await fetch('/api/logs?limit=50');
+      const res = await fetch(`${apiBase}/api/logs?limit=50`);
       const rows = await res.json();
       applyRows(rows);
       const params = new URLSearchParams(window.location.search);
@@ -1903,7 +1936,7 @@ async def dashboard() -> str:
     function connectLogSocket() {
       if (logSocket && (logSocket.readyState === WebSocket.OPEN || logSocket.readyState === WebSocket.CONNECTING)) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      logSocket = new WebSocket(`${protocol}//${window.location.host}/ws/logs`);
+      logSocket = new WebSocket(`${protocol}//${window.location.host}${apiBase}/ws/logs`);
       logSocket.addEventListener('open', () => {
         liveTextEl.textContent = 'WebSocket 已连接';
       });
@@ -2014,7 +2047,7 @@ async def dashboard() -> str:
 
     async function loadDetail(id, shouldFocus = true) {
       activeId = id;
-      const res = await fetch(`/api/logs/${id}`);
+      const res = await fetch(`${apiBase}/api/logs/${id}`);
       const row = await res.json();
       activeDetailPending = row.response_status === null && !row.error;
       const responseIsSse = isSseResponse(row);
@@ -2194,14 +2227,31 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/logs")
 async def api_logs(limit: int = 100) -> list[dict]:
-    return list_log_summaries(limit)
+    return list_log_summaries(limit, None)
+
+
+@app.get("/{access_key}/api/logs")
+async def scoped_api_logs(access_key: str, limit: int = 100) -> list[dict]:
+    return list_log_summaries(limit, access_key)
 
 
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket) -> None:
-    await log_socket_manager.connect(websocket)
+    await log_socket_manager.connect(websocket, None)
     try:
-        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50)})
+        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50, None)})
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        log_socket_manager.disconnect(websocket)
+
+
+@app.websocket("/{access_key}/ws/logs")
+async def scoped_websocket_logs(access_key: str, websocket: WebSocket) -> None:
+    access_key = normalize_access_key(access_key)
+    await log_socket_manager.connect(websocket, access_key)
+    try:
+        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50, access_key)})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -2210,10 +2260,26 @@ async def websocket_logs(websocket: WebSocket) -> None:
 
 @app.get("/api/logs/{log_id}")
 async def api_log_detail(log_id: int) -> JSONResponse:
+    return log_detail_response(log_id, None)
+
+
+@app.get("/{access_key}/api/logs/{log_id}")
+async def scoped_api_log_detail(access_key: str, log_id: int) -> JSONResponse:
+    return log_detail_response(log_id, access_key)
+
+
+def log_detail_response(log_id: int, access_key: str | None = None) -> JSONResponse:
+    access_key = normalize_access_key(access_key)
     ensure_db()
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM request_logs WHERE id = ?", (log_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT * FROM request_logs
+            WHERE id = ? AND ((? IS NULL AND access_key IS NULL) OR access_key = ?)
+            """,
+            (log_id, access_key, access_key),
+        ).fetchone()
     if row is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
@@ -2224,6 +2290,7 @@ async def api_log_detail(log_id: int) -> JSONResponse:
             "created_at": row["created_at"],
             "method": row["method"],
             "target_url": row["target_url"],
+            "access_key": row["access_key"],
             "client_host": row["client_host"],
             "request_headers": json.loads(row["request_headers"] or "{}"),
             "request_body": body_payload(row["request_body"] or b""),
@@ -2253,8 +2320,27 @@ async def api_log_detail(log_id: int) -> JSONResponse:
     )
 
 
+@app.get("/{access_key}", response_class=HTMLResponse)
+async def scoped_dashboard(access_key: str) -> str:
+    if normalize_access_key(access_key) is None:
+        return PlainTextResponse("Not found", status_code=404)
+    return await dashboard()
+
+
+@app.api_route("/{access_key}/{target_url:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def scoped_proxy(access_key: str, target_url: str, request: Request):
+    if access_key in {"http:", "https:"}:
+        separator = "/" if target_url.startswith("/") else "//"
+        return await proxy_to_target(f"{access_key}{separator}{target_url}", request, None)
+    return await proxy_to_target(target_url, request, normalize_access_key(access_key))
+
+
 @app.api_route("/{target_url:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy(target_url: str, request: Request):
+    return await proxy_to_target(target_url, request, None)
+
+
+async def proxy_to_target(target_url: str, request: Request, access_key: str | None):
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
 
@@ -2270,6 +2356,7 @@ async def proxy(target_url: str, request: Request):
             create_log,
             request.method,
             target_url,
+            access_key,
             request.client.host if request.client else None,
             dict(request.headers),
             captured_request_body,
