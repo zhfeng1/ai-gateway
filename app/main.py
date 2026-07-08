@@ -1766,9 +1766,52 @@ async def dashboard() -> str:
       });
     }
 
+    function legacyCopyText(text) {
+      const textarea = document.createElement('textarea');
+      textarea.value = text || '';
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      textarea.style.top = '0';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+
+      const selection = document.getSelection();
+      const selectedRange = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+      textarea.focus();
+      textarea.select();
+      textarea.setSelectionRange(0, textarea.value.length);
+
+      let copied = false;
+      try {
+        copied = document.execCommand('copy');
+      } finally {
+        document.body.removeChild(textarea);
+        if (selection) {
+          selection.removeAllRanges();
+          if (selectedRange) selection.addRange(selectedRange);
+        }
+      }
+      if (!copied) throw new Error('legacy copy failed');
+    }
+
     async function copyText(text) {
-      await navigator.clipboard.writeText(text || '');
-      liveTextEl.textContent = '已复制到剪贴板';
+      const value = text || '';
+      try {
+        if (navigator.clipboard?.writeText && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          legacyCopyText(value);
+        }
+        liveTextEl.textContent = '已复制到剪贴板';
+      } catch {
+        try {
+          legacyCopyText(value);
+          liveTextEl.textContent = '已复制到剪贴板';
+        } catch {
+          liveTextEl.textContent = '复制失败，当前浏览器不允许访问剪贴板';
+        }
+      }
     }
 
     async function loadDetail(id, shouldFocus = true) {
