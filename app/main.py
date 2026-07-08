@@ -1377,6 +1377,7 @@ async def dashboard() -> str:
     let activeId = null;
     let activeTab = 'request';
     let rowsCache = [];
+    let activeRequestBodyView = 'json';
     let activeResponseBodyView = 'json';
     let activeDetailPending = false;
     let activeApiTypeFilter = '';
@@ -1546,6 +1547,191 @@ async def dashboard() -> str:
       } catch {
         return null;
       }
+    }
+
+    function joinTextParts(parts) {
+      return parts
+        .map(item => String(item ?? '').trim())
+        .filter(Boolean)
+        .join('\\n');
+    }
+
+    function textFromContent(content) {
+      if (content === null || content === undefined) return '';
+      if (typeof content === 'string') return content;
+      if (typeof content === 'number' || typeof content === 'boolean') return String(content);
+      if (Array.isArray(content)) return joinTextParts(content.map(item => textFromContent(item)));
+      if (typeof content !== 'object') return '';
+
+      const directKeys = ['text', 'output_text', 'input_text', 'value', 'refusal', 'completion'];
+      for (const key of directKeys) {
+        if (typeof content[key] === 'string') return content[key];
+      }
+      if (typeof content.delta === 'string') return content.delta;
+      if (content.delta && typeof content.delta.text === 'string') return content.delta.text;
+      if (content.delta && typeof content.delta.content === 'string') return content.delta.content;
+      if (content.content !== undefined) return textFromContent(content.content);
+      if (content.message !== undefined) return textFromMessage(content.message);
+      return '';
+    }
+
+    function textFromMessage(message) {
+      if (message === null || message === undefined) return '';
+      if (typeof message !== 'object') return textFromContent(message);
+      const candidates = [
+        message.content,
+        message.text,
+        message.output_text,
+        message.input,
+        message.message,
+        message.completion,
+        message.refusal,
+      ];
+      for (const candidate of candidates) {
+        if (candidate === undefined || candidate === null) continue;
+        const text = textFromContent(candidate);
+        if (text.trim()) return text;
+      }
+      return '';
+    }
+
+    function latestTextFromRole(items, role) {
+      if (!Array.isArray(items)) return '';
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        const itemRole = item && typeof item === 'object' ? (item.role || item.author?.role) : '';
+        if (itemRole === role || (role === 'user' && itemRole === 'human')) {
+          const text = textFromMessage(item);
+          if (text.trim()) return text;
+        }
+      }
+      return '';
+    }
+
+    function latestUserTextFromRequestBody(text) {
+      const body = tryParseJson(text);
+      if (!body) return '';
+
+      const messageLists = [body.messages, body.input, body.contents].filter(Array.isArray);
+      for (const list of messageLists) {
+        const textFromUser = latestTextFromRole(list, 'user');
+        if (textFromUser.trim()) return textFromUser;
+      }
+
+      if (typeof body.input === 'string') return body.input;
+      const directCandidates = [body.prompt, body.query, body.message, body.content];
+      for (const candidate of directCandidates) {
+        const candidateText = textFromContent(candidate);
+        if (candidateText.trim()) return candidateText;
+      }
+
+      for (const list of messageLists) {
+        for (let index = list.length - 1; index >= 0; index -= 1) {
+          const fallbackText = textFromMessage(list[index]);
+          if (fallbackText.trim()) return fallbackText;
+        }
+      }
+      return '';
+    }
+
+    function latestAssistantTextFromPayload(payload) {
+      if (payload === null || payload === undefined) return '';
+      if (typeof payload === 'string') return payload;
+      if (Array.isArray(payload)) {
+        for (let index = payload.length - 1; index >= 0; index -= 1) {
+          const text = latestAssistantTextFromPayload(payload[index]);
+          if (text.trim()) return text;
+        }
+        return '';
+      }
+      if (typeof payload !== 'object') return '';
+
+      if (payload.response) {
+        const responseText = latestAssistantTextFromPayload(payload.response);
+        if (responseText.trim()) return responseText;
+      }
+      if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text;
+
+      if (Array.isArray(payload.choices)) {
+        for (let index = payload.choices.length - 1; index >= 0; index -= 1) {
+          const choice = payload.choices[index];
+          const text = textFromMessage(choice?.message || choice?.delta || choice);
+          if (text.trim()) return text;
+        }
+      }
+
+      if (Array.isArray(payload.output)) {
+        for (let index = payload.output.length - 1; index >= 0; index -= 1) {
+          const item = payload.output[index];
+          const text = textFromMessage(item);
+          if (text.trim()) return text;
+        }
+      }
+
+      if (payload.role === 'assistant' || payload.role === 'model' || payload.type === 'message') {
+        const text = textFromMessage(payload);
+        if (text.trim()) return text;
+      }
+
+      const fallback = textFromMessage(payload);
+      return fallback.trim() ? fallback : '';
+    }
+
+    function latestAssistantTextFromSse(text) {
+      const events = parseSseEvents(text);
+      if (!events.length) return '';
+
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const item = events[index];
+        if (item.event === 'response.completed' || item.event === 'message_stop') {
+          const parsed = tryParseJson(item.data);
+          const text = latestAssistantTextFromPayload(parsed);
+          if (text.trim()) return text;
+        }
+      }
+
+      const chunks = [];
+      for (const item of events) {
+        if (item.data === '[DONE]') continue;
+        const parsed = tryParseJson(item.data);
+        if (!parsed) continue;
+
+        const choiceDelta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || '';
+        if (choiceDelta) {
+          chunks.push(textFromContent(choiceDelta));
+          continue;
+        }
+
+        if (parsed.type === 'response.output_text.delta' || item.event === 'response.output_text.delta') {
+          if (typeof parsed.delta === 'string') chunks.push(parsed.delta);
+          else if (typeof parsed.delta?.text === 'string') chunks.push(parsed.delta.text);
+          continue;
+        }
+
+        if (parsed.type === 'content_block_delta' || item.event === 'content_block_delta') {
+          if (typeof parsed.delta?.text === 'string') chunks.push(parsed.delta.text);
+          continue;
+        }
+
+        const deltaText = textFromContent(parsed.delta);
+        if (deltaText.trim()) chunks.push(deltaText);
+      }
+
+      const streamedText = chunks.join('');
+      if (streamedText.trim()) return streamedText;
+
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const parsed = tryParseJson(events[index].data);
+        const text = latestAssistantTextFromPayload(parsed);
+        if (text.trim()) return text;
+      }
+      return '';
+    }
+
+    function latestAssistantTextFromResponseBody(text) {
+      const sseText = latestAssistantTextFromSse(text);
+      if (sseText.trim()) return sseText;
+      return latestAssistantTextFromPayload(tryParseJson(text));
     }
 
     function completedResponseJsonFromSse(text) {
@@ -1766,6 +1952,18 @@ async def dashboard() -> str:
       });
     }
 
+    function setRequestBodyView(view) {
+      activeRequestBodyView = view;
+      detailEl.querySelectorAll('[data-request-body-view]').forEach(panel => {
+        panel.hidden = panel.dataset.requestBodyView !== view;
+      });
+      detailEl.querySelectorAll('[data-request-view-button]').forEach(button => {
+        const isActive = button.dataset.requestViewButton === view;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', String(isActive));
+      });
+    }
+
     function legacyCopyText(text) {
       const textarea = document.createElement('textarea');
       textarea.value = text || '';
@@ -1824,13 +2022,17 @@ async def dashboard() -> str:
       const responseJsonText = responseIsSse ? (completedJson || '(没有找到可解析的 SSE JSON)') : prettyBody(row.response_body.text);
       const responseSseText = row.response_body.text || '(empty)';
       const requestBodyText = prettyBody(row.request_body.text);
+      const requestMessageText = latestUserTextFromRequestBody(row.request_body.text) || '(没有解析到用户消息)';
+      const responseMessageText = latestAssistantTextFromResponseBody(row.response_body.text) || '(没有解析到返回消息)';
       const requestHeaderText = formatHeaderText(row.request_headers);
       const responseHeaderText = formatHeaderText(row.response_headers);
       const overheadMs = gatewayOverhead(row);
       const reasoningTokens = row.reasoning_tokens;
       const apiType = row.api_type || 'other';
       const isReasoningAnomaly = reasoningTokens === 516;
-      activeResponseBodyView = responseIsSse && ['json', 'sse'].includes(activeResponseBodyView) ? activeResponseBodyView : (responseIsSse ? 'json' : 'body');
+      activeRequestBodyView = ['json', 'text'].includes(activeRequestBodyView) ? activeRequestBodyView : 'json';
+      const responseViews = responseIsSse ? ['json', 'text', 'sse'] : ['json', 'text'];
+      activeResponseBodyView = responseViews.includes(activeResponseBodyView) ? activeResponseBodyView : 'json';
       renderList();
       detailEl.innerHTML = `
         <div class="detail-head">
@@ -1871,8 +2073,18 @@ async def dashboard() -> str:
             <div class="collapsible-content">${renderHeaders(row.request_headers)}</div>
           </details>
           <section>
-            <div class="copy-row"><h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3><button type="button" data-copy="requestBody">复制 Body</button></div>
-            ${renderBodyContent(row.request_body.text)}
+            <div class="copy-row">
+              <h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3>
+              <div class="row-actions">
+                <div class="view-switch" aria-label="Request Body 视图">
+                  <button type="button" data-request-view-button="json">JSON</button>
+                  <button type="button" data-request-view-button="text">Text</button>
+                </div>
+                <button type="button" data-copy="requestBody">复制 Body</button>
+              </div>
+            </div>
+            <div data-request-body-view="json">${renderBodyContent(row.request_body.text)}</div>
+            <pre data-request-body-view="text" translate="no" hidden>${esc(requestMessageText)}</pre>
           </section>
         </div>
         <div data-panel="response" hidden>
@@ -1887,17 +2099,25 @@ async def dashboard() -> str:
                 ${responseIsSse ? `
                   <div class="view-switch" aria-label="Response Body 视图">
                     <button type="button" data-response-view-button="json">JSON</button>
+                    <button type="button" data-response-view-button="text">Text</button>
                     <button type="button" data-response-view-button="sse">SSE</button>
                   </div>
-                ` : ''}
+                ` : `
+                  <div class="view-switch" aria-label="Response Body 视图">
+                    <button type="button" data-response-view-button="json">JSON</button>
+                    <button type="button" data-response-view-button="text">Text</button>
+                  </div>
+                `}
                 <button type="button" data-copy="responseBody">复制 Body</button>
               </div>
             </div>
             ${responseIsSse ? `
               <div data-response-body-view="json">${renderBodyContent(responseJsonText)}</div>
+              <pre data-response-body-view="text" translate="no" hidden>${esc(responseMessageText)}</pre>
               <pre data-response-body-view="sse" translate="no" hidden>${esc(responseSseText)}</pre>
             ` : `
-              <div data-response-body-view="body">${renderBodyContent(row.response_body.text)}</div>
+              <div data-response-body-view="json">${renderBodyContent(row.response_body.text)}</div>
+              <pre data-response-body-view="text" translate="no" hidden>${esc(responseMessageText)}</pre>
             `}
           </section>
         </div>
@@ -1908,24 +2128,33 @@ async def dashboard() -> str:
       const copyMap = {
         url: row.target_url,
         requestHeaders: requestHeaderText,
-        requestBody: requestBodyText,
         responseHeaders: responseHeaderText,
-        responseBody: responseIsSse ? (activeResponseBodyView === 'json' ? responseJsonText : responseSseText) : responseJsonText,
       };
       detailEl.querySelectorAll('[data-copy]').forEach(button => {
         button.addEventListener('click', event => {
           event.preventDefault();
           event.stopPropagation();
-          if (button.dataset.copy === 'responseBody' && responseIsSse) {
-            copyText(activeResponseBodyView === 'json' ? responseJsonText : responseSseText);
+          if (button.dataset.copy === 'requestBody') {
+            copyText(activeRequestBodyView === 'text' ? requestMessageText : requestBodyText);
+            return;
+          }
+          if (button.dataset.copy === 'responseBody') {
+            const responseCopyText = activeResponseBodyView === 'text'
+              ? responseMessageText
+              : (activeResponseBodyView === 'sse' ? responseSseText : responseJsonText);
+            copyText(responseCopyText);
             return;
           }
           copyText(copyMap[button.dataset.copy]);
         });
       });
+      detailEl.querySelectorAll('[data-request-view-button]').forEach(button => {
+        button.addEventListener('click', () => setRequestBodyView(button.dataset.requestViewButton));
+      });
       detailEl.querySelectorAll('[data-response-view-button]').forEach(button => {
         button.addEventListener('click', () => setResponseBodyView(button.dataset.responseViewButton));
       });
+      setRequestBodyView(activeRequestBodyView);
       setResponseBodyView(activeResponseBodyView);
       setTab(['request', 'response'].includes(activeTab) ? activeTab : 'request');
       if (shouldFocus) detailEl.focus({ preventScroll: true });
