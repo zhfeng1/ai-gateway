@@ -1581,13 +1581,28 @@ async def dashboard() -> str:
       const keyHtml = key === '' ? '' : `<span class="json-key">${esc(key)}:</span>`;
       if (value && typeof value === 'object') {
         const isArray = Array.isArray(value);
-        const entries = isArray ? value.map((item, index) => [String(index), item]) : Object.entries(value);
         const openAttr = depth <= JSON_AUTO_OPEN_DEPTH ? ' open' : '';
+        let childMarkup = '';
+        let hasEntries = false;
+        if (isArray) {
+          for (let index = 0; index < value.length; index += 1) {
+            hasEntries = true;
+            childMarkup += renderJsonValue(value[index], String(index), depth + 1, state);
+            if (state.clipped) break;
+          }
+        } else {
+          for (const childKey in value) {
+            if (!Object.prototype.hasOwnProperty.call(value, childKey)) continue;
+            hasEntries = true;
+            childMarkup += renderJsonValue(value[childKey], childKey, depth + 1, state);
+            if (state.clipped) break;
+          }
+        }
         return `
           <details class="json-node"${openAttr}>
             <summary>${keyHtml}<span class="json-type">${isArray ? 'Array' : 'Object'}</span><span class="json-preview">${esc(jsonSummary(value))}</span></summary>
             <div class="json-children">
-              ${entries.length ? entries.map(([childKey, childValue]) => renderJsonValue(childValue, childKey, depth + 1, state)).join('') : '<div class="json-leaf json-preview">(empty)</div>'}
+              ${hasEntries ? childMarkup : '<div class="json-leaf json-preview">(empty)</div>'}
             </div>
           </details>
         `;
