@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from typing import AsyncIterator
@@ -34,6 +35,8 @@ HOP_BY_HOP_HEADERS = {
 
 app = FastAPI(title="AI Gateway", docs_url=None, redoc_url=None)
 RESERVED_ACCESS_KEYS = {"api", "ws", "health", "docs", "redoc", "openapi.json", "favicon.ico"}
+DB_INIT_LOCK = threading.Lock()
+DB_INITIALIZED = False
 
 
 class LogSocketManager:
@@ -68,48 +71,56 @@ def utc_now() -> str:
 
 
 def ensure_db() -> None:
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                method TEXT NOT NULL,
-                target_url TEXT NOT NULL,
-                client_host TEXT,
-                request_headers TEXT NOT NULL,
-                request_body BLOB NOT NULL,
-                request_body_truncated INTEGER NOT NULL DEFAULT 0,
-                response_status INTEGER,
-                response_headers TEXT,
-                response_body BLOB NOT NULL DEFAULT X'',
-                response_body_truncated INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                duration_ms INTEGER,
-                upstream_duration_ms INTEGER,
-                first_byte_ms INTEGER,
-                output_tokens INTEGER,
-                access_key TEXT
+    global DB_INITIALIZED
+    if DB_INITIALIZED:
+        return
+    with DB_INIT_LOCK:
+        if DB_INITIALIZED:
+            return
+        os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    client_host TEXT,
+                    request_headers TEXT NOT NULL,
+                    request_body BLOB NOT NULL,
+                    request_body_truncated INTEGER NOT NULL DEFAULT 0,
+                    response_status INTEGER,
+                    response_headers TEXT,
+                    response_body BLOB NOT NULL DEFAULT X'',
+                    response_body_truncated INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    duration_ms INTEGER,
+                    upstream_duration_ms INTEGER,
+                    first_byte_ms INTEGER,
+                    output_tokens INTEGER,
+                    access_key TEXT
+                )
+                """
             )
-            """
-        )
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
-        if "upstream_duration_ms" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN upstream_duration_ms INTEGER")
-        if "first_byte_ms" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN first_byte_ms INTEGER")
-        if "output_tokens" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
-        if "access_key" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN access_key TEXT")
-        if "reasoning_tokens" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER")
-        if "api_type" not in columns:
-            conn.execute("ALTER TABLE request_logs ADD COLUMN api_type TEXT")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
+            if "upstream_duration_ms" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN upstream_duration_ms INTEGER")
+            if "first_byte_ms" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN first_byte_ms INTEGER")
+            if "output_tokens" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
+            if "access_key" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN access_key TEXT")
+            if "reasoning_tokens" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER")
+            if "api_type" not in columns:
+                conn.execute("ALTER TABLE request_logs ADD COLUMN api_type TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
+        DB_INITIALIZED = True
 
 
 @app.on_event("startup")
@@ -548,8 +559,11 @@ def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[
     ensure_db()
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        where_clause = "access_key IS NULL" if access_key is None else "access_key = ?"
+        params = () if access_key is None else (access_key,)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, created_at, method, target_url, client_host, response_status,
                    access_key, duration_ms, upstream_duration_ms, first_byte_ms,
                    output_tokens, reasoning_tokens, api_type, error,
@@ -557,11 +571,11 @@ def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[
                    length(response_body) AS response_body_bytes,
                    request_body_truncated, response_body_truncated
             FROM request_logs
-            WHERE (? IS NULL AND access_key IS NULL) OR access_key = ?
+            WHERE {where_clause}
             ORDER BY id DESC
             LIMIT ?
             """,
-            (access_key, access_key, limit),
+            (*params, limit),
         ).fetchall()
     return [row_to_summary(row) for row in rows]
 
