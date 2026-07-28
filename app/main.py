@@ -106,6 +106,10 @@ def ensure_db() -> None:
             conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
         if "access_key" not in columns:
             conn.execute("ALTER TABLE request_logs ADD COLUMN access_key TEXT")
+        if "reasoning_tokens" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER")
+        if "api_type" not in columns:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN api_type TEXT")
 
 
 @app.on_event("startup")
@@ -138,8 +142,8 @@ def create_log(
         """
         INSERT INTO request_logs (
             created_at, method, target_url, access_key, client_host, request_headers,
-            request_body, request_body_truncated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            request_body, request_body_truncated, api_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utc_now(),
@@ -150,6 +154,7 @@ def create_log(
             json.dumps(request_headers, ensure_ascii=False, indent=2),
             request_body,
             int(request_body_truncated),
+            api_type_from_log(target_url, request_body, b""),
         ),
     )
     return int(cur.lastrowid)
@@ -175,6 +180,9 @@ def finish_log(
     if first_byte_at is not None:
         first_byte_ms = int((first_byte_at - started_at) * 1000)
     response_bytes = bytes(response_body)
+    output_tokens = output_tokens_from_body(response_bytes)
+    reasoning_tokens = reasoning_tokens_from_body(response_bytes)
+    response_api_type = api_type_from_body(response_bytes)
     db_execute(
         """
         UPDATE request_logs
@@ -186,7 +194,9 @@ def finish_log(
             duration_ms = ?,
             upstream_duration_ms = ?,
             first_byte_ms = ?,
-            output_tokens = ?
+            output_tokens = ?,
+            reasoning_tokens = ?,
+            api_type = COALESCE(?, api_type)
         WHERE id = ?
         """,
         (
@@ -198,7 +208,9 @@ def finish_log(
             int((finished_at - started_at) * 1000),
             upstream_duration_ms,
             first_byte_ms,
-            output_tokens_from_body(response_bytes),
+            output_tokens,
+            reasoning_tokens,
+            response_api_type,
             log_id,
         ),
     )
@@ -236,17 +248,32 @@ def parse_sse_events(text: str) -> list[dict[str, str]]:
     return events
 
 
+def last_completed_sse_data(text: str) -> str | None:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    marker_index = text.rfind("event: response.completed")
+    if marker_index < 0:
+        return None
+    block = text[marker_index:].split("\n\n", 1)[0]
+    data_lines = []
+    for raw_line in block.splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    return "\n".join(data_lines) if data_lines else None
+
+
 def parse_completed_response_from_sse(body: bytes) -> object | None:
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    for item in reversed(parse_sse_events(text)):
-        if item["event"] == "response.completed":
-            try:
-                return json.loads(item["data"])
-            except json.JSONDecodeError:
-                return None
+    completed_data = last_completed_sse_data(text)
+    if completed_data is None:
+        return None
+    try:
+        return json.loads(completed_data)
+    except json.JSONDecodeError:
+        return None
     return None
 
 
@@ -410,7 +437,7 @@ def api_type_from_body(body: bytes) -> str | None:
     return None
 
 
-def api_type_from_log(target_url: str, request_body: bytes, response_body: bytes) -> str:
+def api_type_from_target_url(target_url: str) -> str | None:
     normalized_url = target_url.lower()
     if "/chat/completions" in normalized_url:
         return "chat_completions"
@@ -418,7 +445,11 @@ def api_type_from_log(target_url: str, request_body: bytes, response_body: bytes
         return "responses"
     if "/messages" in normalized_url:
         return "messages"
-    return api_type_from_body(response_body) or api_type_from_body(request_body) or "other"
+    return None
+
+
+def api_type_from_log(target_url: str, request_body: bytes, response_body: bytes) -> str:
+    return api_type_from_target_url(target_url) or api_type_from_body(response_body) or api_type_from_body(request_body) or "other"
 
 
 def append_capture(existing: bytearray, chunk: bytes) -> bool:
@@ -475,7 +506,7 @@ def tps_from_values(output_tokens: int | None, duration_ms: int | None, first_by
 
 
 def row_to_summary(row: sqlite3.Row) -> dict:
-    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(row["response_body"] or b"")
+    output_tokens = row["output_tokens"]
     return {
         "id": row["id"],
         "created_at": row["created_at"],
@@ -495,14 +526,10 @@ def row_to_summary(row: sqlite3.Row) -> dict:
             else None
         ),
         "error": row["error"],
-        "request_body_bytes": len(row["request_body"] or b""),
-        "response_body_bytes": len(row["response_body"] or b""),
-        "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
-        "api_type": api_type_from_log(
-            row["target_url"] or "",
-            row["request_body"] or b"",
-            row["response_body"] or b"",
-        ),
+        "request_body_bytes": row["request_body_bytes"] or 0,
+        "response_body_bytes": row["response_body_bytes"] or 0,
+        "reasoning_tokens": row["reasoning_tokens"],
+        "api_type": row["api_type"] or api_type_from_target_url(row["target_url"] or "") or "other",
         "request_body_truncated": bool(row["request_body_truncated"]),
         "response_body_truncated": bool(row["response_body_truncated"]),
     }
@@ -524,7 +551,10 @@ def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[
         rows = conn.execute(
             """
             SELECT id, created_at, method, target_url, client_host, response_status,
-                   access_key, duration_ms, upstream_duration_ms, first_byte_ms, output_tokens, error, request_body, response_body,
+                   access_key, duration_ms, upstream_duration_ms, first_byte_ms,
+                   output_tokens, reasoning_tokens, api_type, error,
+                   length(request_body) AS request_body_bytes,
+                   length(response_body) AS response_body_bytes,
                    request_body_truncated, response_body_truncated
             FROM request_logs
             WHERE (? IS NULL AND access_key IS NULL) OR access_key = ?
@@ -1416,6 +1446,11 @@ async def dashboard() -> str:
     let activeApiTypeFilter = '';
     let logSocket = null;
     let reconnectTimer = null;
+    const JSON_PARSE_MAX_CHARS = 2_000_000;
+    const JSON_TREE_MAX_CHARS = 450_000;
+    const JSON_NODE_LIMIT = 1_500;
+    const JSON_AUTO_OPEN_DEPTH = 1;
+    const TEXT_RENDER_LIMIT = 320_000;
 
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({
@@ -1495,6 +1530,7 @@ async def dashboard() -> str:
     function prettyBody(body) {
       const text = body || '';
       if (!text.trim()) return '(empty)';
+      if (text.length > JSON_PARSE_MAX_CHARS) return text;
       try {
         return JSON.stringify(JSON.parse(text), null, 2);
       } catch {
@@ -1522,16 +1558,36 @@ async def dashboard() -> str:
       return String(value);
     }
 
-    function renderJsonValue(value, key = '', depth = 0) {
+    function displayText(text, limit = TEXT_RENDER_LIMIT) {
+      const value = String(text ?? '');
+      if (value.length <= limit) return value;
+      const headLength = Math.floor(limit * 0.72);
+      const tailLength = Math.max(0, limit - headLength);
+      return `${value.slice(0, headLength)}\n\n... 已省略 ${numberFormatter.format(value.length - limit)} 个字符，复制 Body 可获取完整内容 ...\n\n${value.slice(value.length - tailLength)}`;
+    }
+
+    function renderPreText(text, attrs = '') {
+      const attrText = attrs ? ` ${attrs}` : '';
+      return `<pre${attrText} translate="no">${esc(displayText(text || '(empty)'))}</pre>`;
+    }
+
+    function renderJsonValue(value, key = '', depth = 0, state = { count: 0, clipped: false }) {
+      state.count += 1;
+      if (state.count > JSON_NODE_LIMIT) {
+        if (state.clipped) return '';
+        state.clipped = true;
+        return '<div class="json-leaf json-preview">已省略后续节点，复制 Body 可获取完整内容</div>';
+      }
       const keyHtml = key === '' ? '' : `<span class="json-key">${esc(key)}:</span>`;
       if (value && typeof value === 'object') {
         const isArray = Array.isArray(value);
         const entries = isArray ? value.map((item, index) => [String(index), item]) : Object.entries(value);
+        const openAttr = depth <= JSON_AUTO_OPEN_DEPTH ? ' open' : '';
         return `
-          <details class="json-node" open>
+          <details class="json-node"${openAttr}>
             <summary>${keyHtml}<span class="json-type">${isArray ? 'Array' : 'Object'}</span><span class="json-preview">${esc(jsonSummary(value))}</span></summary>
             <div class="json-children">
-              ${entries.length ? entries.map(([childKey, childValue]) => renderJsonValue(childValue, childKey, depth + 1)).join('') : '<div class="json-leaf json-preview">(empty)</div>'}
+              ${entries.length ? entries.map(([childKey, childValue]) => renderJsonValue(childValue, childKey, depth + 1, state)).join('') : '<div class="json-leaf json-preview">(empty)</div>'}
             </div>
           </details>
         `;
@@ -1542,10 +1598,17 @@ async def dashboard() -> str:
     function renderBodyContent(text) {
       const body = text || '';
       if (!body.trim()) return '<pre translate="no">(empty)</pre>';
+      if (body.length > JSON_PARSE_MAX_CHARS) {
+        return renderPreText(`内容较大，已切换为文本预览。\n\n${body}`);
+      }
       try {
-        return `<div class="json-viewer" translate="no">${renderJsonValue(JSON.parse(body))}</div>`;
+        const parsed = JSON.parse(body);
+        const intro = body.length > JSON_TREE_MAX_CHARS
+          ? '<div class="json-leaf json-preview">JSON 较大，仅渲染部分节点，复制 Body 可获取完整内容</div>'
+          : '';
+        return `<div class="json-viewer" translate="no">${intro}${renderJsonValue(parsed)}</div>`;
       } catch {
-        return `<pre translate="no">${esc(body)}</pre>`;
+        return renderPreText(body);
       }
     }
 
@@ -1572,6 +1635,20 @@ async def dashboard() -> str:
         }
       }
       return events;
+    }
+
+    function lastCompletedSseData(text) {
+      const source = String(text || '');
+      const marker = 'event: response.completed';
+      const markerIndex = source.lastIndexOf(marker);
+      if (markerIndex < 0) return '';
+      const block = source.slice(markerIndex).split(/\\r?\\n\\r?\\n/, 1)[0];
+      const dataLines = [];
+      for (const rawLine of block.split(/\\r?\\n/)) {
+        const line = rawLine.trimEnd();
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+      }
+      return dataLines.join('\\n');
     }
 
     function tryParseJson(text) {
@@ -1711,6 +1788,13 @@ async def dashboard() -> str:
     }
 
     function latestAssistantTextFromSse(text) {
+      const completedData = lastCompletedSseData(text);
+      if (completedData && completedData.length <= JSON_PARSE_MAX_CHARS) {
+        const completedText = latestAssistantTextFromPayload(tryParseJson(completedData));
+        if (completedText.trim()) return completedText;
+      }
+      if (completedData && completedData.length > JSON_PARSE_MAX_CHARS) return '';
+
       const events = parseSseEvents(text);
       if (!events.length) return '';
 
@@ -1768,6 +1852,13 @@ async def dashboard() -> str:
     }
 
     function completedResponseJsonFromSse(text) {
+      const completedData = lastCompletedSseData(text);
+      if (completedData) {
+        if (completedData.length > JSON_PARSE_MAX_CHARS) return completedData;
+        const parsed = tryParseJson(completedData);
+        return parsed ? JSON.stringify(parsed, null, 2) : completedData;
+      }
+
       const events = parseSseEvents(text);
 
       for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -1918,19 +2009,30 @@ async def dashboard() -> str:
 
     async function loadList({ refreshDetail = true } = {}) {
       liveTextEl.textContent = '正在加载…';
-      const res = await fetch(`${apiBase}/api/logs?limit=50`);
-      const rows = await res.json();
-      applyRows(rows);
-      const params = new URLSearchParams(window.location.search);
-      const selected = Number(params.get('id')) || activeId || rowsCache[0]?.id;
-      const nextTab = params.get('tab');
-      if (nextTab) activeTab = nextTab;
-      if (selected && rowsCache.some(row => row.id === selected)) {
-        await loadDetail(selected, false);
-      } else if (!rowsCache.length) {
-        detailEl.innerHTML = '<div class="empty">暂无记录</div>';
+      try {
+        const res = await fetch(`${apiBase}/api/logs?limit=50`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const rows = await res.json();
+        applyRows(rows);
+        const params = new URLSearchParams(window.location.search);
+        const selectedFromUrl = Number(params.get('id')) || null;
+        const selected = selectedFromUrl || activeId;
+        const nextTab = params.get('tab');
+        if (nextTab) activeTab = nextTab;
+        if (refreshDetail && selected && rowsCache.some(row => row.id === selected)) {
+          await loadDetail(selected, false);
+        } else if (!rowsCache.length) {
+          detailEl.innerHTML = '<div class="empty">暂无记录</div>';
+        } else if (!activeId) {
+          detailEl.innerHTML = '<div class="empty">选择左侧请求查看详情</div>';
+        }
+        liveTextEl.textContent = `最近更新 ${dateFormatter.format(new Date())}`;
+      } catch (error) {
+        liveTextEl.textContent = `加载失败：${String(error.message || error)}`;
+        if (!rowsCache.length) {
+          detailEl.innerHTML = '<div class="empty">请求列表加载失败，请稍后重试</div>';
+        }
       }
-      liveTextEl.textContent = `最近更新 ${dateFormatter.format(new Date())}`;
     }
 
     function connectLogSocket() {
@@ -2047,8 +2149,19 @@ async def dashboard() -> str:
 
     async function loadDetail(id, shouldFocus = true) {
       activeId = id;
-      const res = await fetch(`${apiBase}/api/logs/${id}`);
-      const row = await res.json();
+      renderList();
+      detailEl.innerHTML = '<div class="empty">正在加载详情…</div>';
+      let row;
+      try {
+        const res = await fetch(`${apiBase}/api/logs/${id}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        row = await res.json();
+      } catch (error) {
+        activeDetailPending = false;
+        detailEl.innerHTML = `<div class="empty">详情加载失败：${esc(String(error.message || error))}</div>`;
+        liveTextEl.textContent = '详情加载失败';
+        return;
+      }
       activeDetailPending = row.response_status === null && !row.error;
       const responseIsSse = isSseResponse(row);
       const completedJson = responseIsSse ? completedResponseJsonFromSse(row.response_body.text) : '';
@@ -2117,7 +2230,7 @@ async def dashboard() -> str:
               </div>
             </div>
             <div data-request-body-view="json">${renderBodyContent(row.request_body.text)}</div>
-            <pre data-request-body-view="text" translate="no" hidden>${esc(requestMessageText)}</pre>
+            ${renderPreText(requestMessageText, 'data-request-body-view="text" hidden')}
           </section>
         </div>
         <div data-panel="response" hidden>
@@ -2146,11 +2259,11 @@ async def dashboard() -> str:
             </div>
             ${responseIsSse ? `
               <div data-response-body-view="json">${renderBodyContent(responseJsonText)}</div>
-              <pre data-response-body-view="text" translate="no" hidden>${esc(responseMessageText)}</pre>
-              <pre data-response-body-view="sse" translate="no" hidden>${esc(responseSseText)}</pre>
+              ${renderPreText(responseMessageText, 'data-response-body-view="text" hidden')}
+              ${renderPreText(responseSseText, 'data-response-body-view="sse" hidden')}
             ` : `
               <div data-response-body-view="json">${renderBodyContent(row.response_body.text)}</div>
-              <pre data-response-body-view="text" translate="no" hidden>${esc(responseMessageText)}</pre>
+              ${renderPreText(responseMessageText, 'data-response-body-view="text" hidden')}
             `}
           </section>
         </div>
@@ -2225,21 +2338,27 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/favicon.ico")
+async def favicon() -> PlainTextResponse:
+    return PlainTextResponse("", status_code=204)
+
+
 @app.get("/api/logs")
 async def api_logs(limit: int = 100) -> list[dict]:
-    return list_log_summaries(limit, None)
+    return await asyncio.to_thread(list_log_summaries, limit, None)
 
 
 @app.get("/{access_key}/api/logs")
 async def scoped_api_logs(access_key: str, limit: int = 100) -> list[dict]:
-    return list_log_summaries(limit, access_key)
+    return await asyncio.to_thread(list_log_summaries, limit, access_key)
 
 
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket) -> None:
     await log_socket_manager.connect(websocket, None)
     try:
-        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50, None)})
+        rows = await asyncio.to_thread(list_log_summaries, 50, None)
+        await websocket.send_json({"type": "logs", "changed_id": None, "rows": rows})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -2251,7 +2370,8 @@ async def scoped_websocket_logs(access_key: str, websocket: WebSocket) -> None:
     access_key = normalize_access_key(access_key)
     await log_socket_manager.connect(websocket, access_key)
     try:
-        await websocket.send_json({"type": "logs", "changed_id": None, "rows": list_log_summaries(50, access_key)})
+        rows = await asyncio.to_thread(list_log_summaries, 50, access_key)
+        await websocket.send_json({"type": "logs", "changed_id": None, "rows": rows})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -2260,12 +2380,12 @@ async def scoped_websocket_logs(access_key: str, websocket: WebSocket) -> None:
 
 @app.get("/api/logs/{log_id}")
 async def api_log_detail(log_id: int) -> JSONResponse:
-    return log_detail_response(log_id, None)
+    return await asyncio.to_thread(log_detail_response, log_id, None)
 
 
 @app.get("/{access_key}/api/logs/{log_id}")
 async def scoped_api_log_detail(access_key: str, log_id: int) -> JSONResponse:
-    return log_detail_response(log_id, access_key)
+    return await asyncio.to_thread(log_detail_response, log_id, access_key)
 
 
 def log_detail_response(log_id: int, access_key: str | None = None) -> JSONResponse:
@@ -2283,7 +2403,11 @@ def log_detail_response(log_id: int, access_key: str | None = None) -> JSONRespo
     if row is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(row["response_body"] or b"")
+    response_body = row["response_body"] or b""
+    request_body = row["request_body"] or b""
+    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(response_body)
+    reasoning_tokens = row["reasoning_tokens"] if row["reasoning_tokens"] is not None else reasoning_tokens_from_body(response_body)
+    api_type = row["api_type"] or api_type_from_log(row["target_url"] or "", request_body, response_body)
     return JSONResponse(
         {
             "id": row["id"],
@@ -2293,18 +2417,14 @@ def log_detail_response(log_id: int, access_key: str | None = None) -> JSONRespo
             "access_key": row["access_key"],
             "client_host": row["client_host"],
             "request_headers": json.loads(row["request_headers"] or "{}"),
-            "request_body": body_payload(row["request_body"] or b""),
+            "request_body": body_payload(request_body),
             "request_body_truncated": bool(row["request_body_truncated"]),
             "response_status": row["response_status"],
             "response_headers": json.loads(row["response_headers"] or "{}"),
-            "response_body": body_payload(row["response_body"] or b""),
+            "response_body": body_payload(response_body),
             "response_body_truncated": bool(row["response_body_truncated"]),
-            "reasoning_tokens": reasoning_tokens_from_body(row["response_body"] or b""),
-            "api_type": api_type_from_log(
-                row["target_url"] or "",
-                row["request_body"] or b"",
-                row["response_body"] or b"",
-            ),
+            "reasoning_tokens": reasoning_tokens,
+            "api_type": api_type,
             "error": row["error"],
             "duration_ms": row["duration_ms"],
             "upstream_duration_ms": row["upstream_duration_ms"],
