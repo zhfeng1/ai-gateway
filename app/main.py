@@ -1883,6 +1883,31 @@ async def dashboard() -> str:
       padding: 14px;
     }
     .dialog-content .json-viewer { max-height: none; }
+    .record-list {
+      display: grid;
+      gap: 12px;
+    }
+    .record-block {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(5, 7, 11, .34);
+      overflow: hidden;
+    }
+    .record-title {
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-raised);
+      color: var(--muted-strong);
+      font-size: 12px;
+      font-weight: 750;
+    }
+    .record-block .kv { border: 0; border-radius: 0; }
+    .record-block .kv-row { grid-template-columns: minmax(150px, 24%) minmax(0, 1fr); }
+    .record-block .kv-value .json-viewer {
+      margin: -4px;
+      max-height: 320px;
+    }
     [hidden] { display: none !important; }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -1903,6 +1928,7 @@ async def dashboard() -> str:
       .endpoint-actions { justify-content: flex-start; }
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-row { grid-template-columns: 1fr; }
+      .record-block .kv-row { grid-template-columns: 1fr; }
       .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
     }
     @media (min-width: 821px) and (max-width: 1180px) {
@@ -2752,13 +2778,105 @@ async def dashboard() -> str:
       dialogContent.innerHTML = renderBodyContent(JSON.stringify(payload ?? {}, null, 2));
     }
 
+    const newApiColumnLabels = {
+      id: '记录编号',
+      user_id: '用户 ID',
+      created_at: '创建时间',
+      type: '日志类型',
+      content: '日志内容',
+      username: '用户名',
+      token_name: '令牌名称',
+      model_name: '模型名称',
+      quota: '消耗额度',
+      prompt_tokens: '输入 Tokens',
+      completion_tokens: '输出 Tokens',
+      use_time: '请求用时',
+      is_stream: '流式请求',
+      channel: '渠道 ID',
+      channel_id: '渠道 ID',
+      channel_name: '渠道名称',
+      token_id: '令牌 ID',
+      group: '用户分组',
+      ip: '请求 IP',
+      request_id: '请求 ID',
+      upstream_request_id: '上游请求 ID',
+      other: '其他信息',
+    };
+    const newApiColumnOrder = Object.keys(newApiColumnLabels);
+    const newApiLogTypes = {
+      0: '未知', 1: '充值', 2: '消费', 3: '管理', 4: '系统', 5: '错误', 6: '退款', 7: '登录'
+    };
+
+    function newApiColumnLabel(key) {
+      return newApiColumnLabels[key] || `其他字段（${key}）`;
+    }
+
+    function sortedNewApiEntries(data) {
+      return Object.entries(data || {}).sort(([left], [right]) => {
+        const leftIndex = newApiColumnOrder.indexOf(left);
+        const rightIndex = newApiColumnOrder.indexOf(right);
+        if (leftIndex < 0 && rightIndex < 0) return left.localeCompare(right);
+        if (leftIndex < 0) return 1;
+        if (rightIndex < 0) return -1;
+        return leftIndex - rightIndex;
+      });
+    }
+
+    function newApiCellValue(key, value) {
+      if (value === null || value === undefined || value === '') return '<span class="secondary">-</span>';
+      if (key === 'type' && newApiLogTypes[value] !== undefined) {
+        return `${esc(newApiLogTypes[value])}（${esc(value)}）`;
+      }
+      if (key === 'created_at' && /^\\d+$/.test(String(value))) {
+        const timestamp = Number(value);
+        const milliseconds = timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
+        return `${esc(formatDate(new Date(milliseconds).toISOString()))}<span class="secondary"> · ${esc(value)}</span>`;
+      }
+      if (typeof value === 'boolean') return value ? '是' : '否';
+      if (key === 'use_time' && typeof value === 'number') return `${esc(value)} 秒`;
+      if (typeof value === 'object') return renderBodyContent(JSON.stringify(value, null, 2));
+      if (typeof value === 'string' && (value.trim().startsWith('{') || value.trim().startsWith('['))) {
+        const parsed = tryParseJson(value);
+        if (parsed !== null) return renderBodyContent(JSON.stringify(parsed, null, 2));
+      }
+      return esc(value);
+    }
+
+    function renderNewApiRecords(payload) {
+      const records = [];
+      const seen = new Set();
+      for (const match of payload?.matches || []) {
+        const data = match?.data;
+        if (!data || typeof data !== 'object') continue;
+        const fingerprint = JSON.stringify(data);
+        if (seen.has(fingerprint)) continue;
+        seen.add(fingerprint);
+        records.push(data);
+      }
+      if (!records.length) {
+        dialogContent.innerHTML = '<div class="empty">没有查询到对应的 new-api 日志记录</div>';
+        return;
+      }
+      dialogContent.innerHTML = `<div class="record-list">${records.map((record, index) => `
+        <article class="record-block">
+          <h3 class="record-title">日志记录 ${numberFormatter.format(index + 1)}</h3>
+          <div class="kv">${sortedNewApiEntries(record).map(([key, value]) => `
+            <div class="kv-row">
+              <div class="kv-key">${esc(newApiColumnLabel(key))}</div>
+              <div class="kv-value" translate="no">${newApiCellValue(key, value)}</div>
+            </div>
+          `).join('')}</div>
+        </article>
+      `).join('')}</div>`;
+    }
+
     async function loadNewApiDetail(logId, requestId) {
       openDataDialog(`new-api 请求详情 · ${requestId}`);
       try {
         const res = await fetch(`${apiBase}/api/logs/${logId}/new-api`);
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
-        renderDialogPayload(payload);
+        renderNewApiRecords(payload);
       } catch (error) {
         dialogContent.innerHTML = `<div class="empty">加载失败：${esc(String(error.message || error))}</div>`;
       }
