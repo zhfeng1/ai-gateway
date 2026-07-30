@@ -6,11 +6,12 @@ AI Gateway 是一个用于调试 AI 接口的 Python HTTP 网关。它可以把�
 
 - 通用转发：访问 `http://127.0.0.1:20000/http://upstream/v1` 会自动转发到上游地址。
 - 路径隔离：支持 `http://127.0.0.1:20000/password/https://upstream/v1`，打开 `/password` 只查看该路径空间下的请求记录。
-- 完整记录：Request Header、Response Header、Request Body、Response Body 都会写入 SQLite。
+- 完整记录：Request Header、Response Header、Request Body、Response Body 可写入 SQLite 或 PostgreSQL。
 - 流式支持：支持 SSE 流式响应，适配 OpenAI Responses、Chat Completions、Messages 等接口。
 - 多视图查看：Body 支持 JSON 树形预览、Text 提取视图，SSE 响应支持 JSON / Text / SSE 切换。
 - 性能指标：展示本项目耗时、上游接口耗时、差值、首字用时、TPS、Reasoning Tokens。
 - 实时列表：通过 WebSocket 推送请求列表，已完成请求不会反复刷新右侧详情。
+- new-api 联动：根据 `x-oneapi-request-id` 查询 `new-api-log`，展示请求人和完整消费日志，并支持 Request ID 反查。
 - 桌面包：Release 提供 macOS `.app` 和 Windows `.exe`，双击即可打开内嵌控制台窗口。
 
 ## Docker Compose 部署
@@ -31,6 +32,20 @@ http://127.0.0.1:20000/
 ```text
 ./data/ai_gateway.sqlite3
 ```
+
+默认使用 SQLite。需要切换 PostgreSQL 时，先复制环境变量示例并填写实际账号密码：
+
+```bash
+cp .env.example .env
+```
+
+```env
+DATABASE_TYPE=postgres
+DATABASE_URL=jdbc:postgresql://user:password@192.168.1.26:8097/ai-gateway
+NEW_API_LOG_DATABASE_URL=jdbc:postgresql://user:password@192.168.1.26:8097/new-api-log
+```
+
+`DATABASE_URL` 和 `NEW_API_LOG_DATABASE_URL` 同时兼容 `jdbc:postgresql://` 与 `postgresql://` 格式。未设置 PostgreSQL 配置时，原有 SQLite 部署方式不受影响。
 
 Docker Compose 默认只监听本机地址：
 
@@ -80,6 +95,8 @@ http://127.0.0.1:20000/my-secret
 - JSON Body 使用可展开的树形预览。
 - SSE Response 可以切换 JSON、Text、SSE 三种视图。
 - `reasoning_tokens = 516` 时会在列表和详情中标记异常。
+- Response Header 包含 `x-oneapi-request-id` 时，详情顶部可打开 new-api 日志弹窗，左侧会显示请求人。
+- 左侧支持输入 Request ID 反查，同时返回 AI Gateway 与 `new-api-log` 两侧的数据。
 
 ## 本地桌面版
 
@@ -127,7 +144,12 @@ data\ai_gateway.sqlite3
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `DATABASE_TYPE` | `sqlite` | 日志存储类型：`sqlite` 或 `postgres` |
 | `DATABASE_PATH` | `/data/ai_gateway.sqlite3` | SQLite 数据库路径 |
+| `DATABASE_URL` | - | AI Gateway PostgreSQL 连接串，设置后自动启用 PostgreSQL |
+| `NEW_API_LOG_DATABASE_URL` | - | new-api 日志数据库 PostgreSQL 连接串 |
+| `NEW_API_LOG_TABLES` | `logs` | new-api 日志查询表，多个表用逗号分隔 |
+| `NEW_API_LOG_QUERY_TIMEOUT_SECONDS` | `3` | new-api 日志查询超时时间 |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | 上游请求超时时间 |
 | `MAX_CAPTURE_BYTES` | `0` | Body 最大记录字节数，`0` 表示完整记录 |
 

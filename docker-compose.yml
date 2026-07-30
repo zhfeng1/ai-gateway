@@ -6,7 +6,12 @@ services:
     ports:
       - "127.0.0.1:20000:20000"
     environment:
+      DATABASE_TYPE: ${DATABASE_TYPE:-sqlite}
       DATABASE_PATH: /data/ai_gateway.sqlite3
+      DATABASE_URL: ${DATABASE_URL:-}
+      NEW_API_LOG_DATABASE_URL: ${NEW_API_LOG_DATABASE_URL:-}
+      NEW_API_LOG_TABLES: ${NEW_API_LOG_TABLES:-logs}
+      NEW_API_LOG_QUERY_TIMEOUT_SECONDS: ${NEW_API_LOG_QUERY_TIMEOUT_SECONDS:-3}
       REQUEST_TIMEOUT_SECONDS: "600"
       MAX_CAPTURE_BYTES: "0"
     volumes:

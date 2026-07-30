@@ -5,18 +5,47 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
-from typing import AsyncIterator
-from urllib.parse import urlsplit
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from typing import Any, AsyncIterator
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - SQLite deployments do not need psycopg at import time.
+    psycopg = None
+    dict_row = None
+
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/ai_gateway.sqlite3")
+DATABASE_TYPE = (os.getenv("DATABASE_TYPE") or os.getenv("DB_TYPE") or "sqlite").strip().lower()
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN") or os.getenv("POSTGRES_URL")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "600"))
 MAX_CAPTURE_BYTES = int(os.getenv("MAX_CAPTURE_BYTES", "0"))
+POSTGRES_CONNECT_TIMEOUT_SECONDS = int(float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
+NEW_API_LOG_DATABASE_URL = (
+    os.getenv("NEW_API_LOG_DATABASE_URL")
+    or os.getenv("NEW_API_LOG_DB_DSN")
+    or os.getenv("NEW_API_LOG_POSTGRES_DSN")
+    or os.getenv("NEW_API_LOG_POSTGRES_URL")
+)
+NEW_API_LOG_QUERY_TIMEOUT_SECONDS = float(os.getenv("NEW_API_LOG_QUERY_TIMEOUT_SECONDS", "3"))
+NEW_API_LOG_MAX_ROWS_PER_TABLE = int(os.getenv("NEW_API_LOG_MAX_ROWS_PER_TABLE", "5"))
+NEW_API_LOG_TABLES = [item.strip() for item in os.getenv("NEW_API_LOG_TABLES", "logs").split(",") if item.strip()]
+NEW_API_LOG_REQUEST_ID_COLUMNS = [
+    item.strip()
+    for item in os.getenv(
+        "NEW_API_LOG_REQUEST_ID_COLUMNS",
+        "request_id,x_oneapi_request_id,oneapi_request_id,one_api_request_id,requestid,requestId",
+    ).split(",")
+    if item.strip()
+]
+NEW_API_LOG_MAX_JSON_BYTES = int(os.getenv("NEW_API_LOG_MAX_JSON_BYTES", "1000000"))
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -37,6 +66,8 @@ app = FastAPI(title="AI Gateway", docs_url=None, redoc_url=None)
 RESERVED_ACCESS_KEYS = {"api", "ws", "health", "docs", "redoc", "openapi.json", "favicon.ico"}
 DB_INIT_LOCK = threading.Lock()
 DB_INITIALIZED = False
+NEW_API_LOG_SCHEMA_LOCK = threading.Lock()
+NEW_API_LOG_SCHEMA_CACHE: list[dict[str, Any]] | None = None
 
 
 class LogSocketManager:
@@ -70,6 +101,118 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def normalize_postgres_dsn(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.startswith("jdbc:postgresql://"):
+        value = "postgresql://" + value[len("jdbc:postgresql://") :]
+    return value
+
+
+def build_postgres_dsn(prefix: str, default_database: str) -> str | None:
+    url = (
+        os.getenv(f"{prefix}DATABASE_URL")
+        or os.getenv(f"{prefix}DB_DSN")
+        or os.getenv(f"{prefix}POSTGRES_DSN")
+        or os.getenv(f"{prefix}POSTGRES_URL")
+    )
+    if url:
+        return normalize_postgres_dsn(url)
+
+    host = os.getenv(f"{prefix}POSTGRES_HOST")
+    if not host:
+        return None
+    port = os.getenv(f"{prefix}POSTGRES_PORT", "5432")
+    database = os.getenv(f"{prefix}POSTGRES_DB", default_database)
+    user = os.getenv(f"{prefix}POSTGRES_USER")
+    password = os.getenv(f"{prefix}POSTGRES_PASSWORD")
+    auth = ""
+    if user:
+        auth = quote(user, safe="")
+        if password:
+            auth += f":{quote(password, safe='')}"
+        auth += "@"
+    return f"postgresql://{auth}{host}:{port}/{database}"
+
+
+DATABASE_URL = build_postgres_dsn("", "ai-gateway") or normalize_postgres_dsn(DATABASE_URL)
+NEW_API_LOG_DATABASE_URL = build_postgres_dsn("NEW_API_LOG_", "new-api-log") or normalize_postgres_dsn(NEW_API_LOG_DATABASE_URL)
+if DATABASE_TYPE in {"postgresql", "pg"}:
+    DATABASE_TYPE = "postgres"
+if DATABASE_TYPE not in {"sqlite", "postgres"}:
+    DATABASE_TYPE = "sqlite"
+if DATABASE_TYPE == "sqlite" and DATABASE_URL:
+    DATABASE_TYPE = "postgres"
+
+
+def using_postgres() -> bool:
+    return DATABASE_TYPE == "postgres"
+
+
+def require_psycopg() -> None:
+    if psycopg is None or dict_row is None:
+        raise RuntimeError("PostgreSQL support requires psycopg[binary]. Run pip install -r requirements.txt.")
+
+
+def connect_gateway_postgres(row_factory: Any | None = None):
+    require_psycopg()
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_TYPE=postgres requires DATABASE_URL or POSTGRES_* environment variables.")
+    kwargs: dict[str, Any] = {"connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS}
+    if row_factory is not None:
+        kwargs["row_factory"] = row_factory
+    return psycopg.connect(DATABASE_URL, **kwargs)
+
+
+def connect_new_api_log_postgres(row_factory: Any | None = None):
+    require_psycopg()
+    if not NEW_API_LOG_DATABASE_URL:
+        raise RuntimeError("NEW_API_LOG_DATABASE_URL is not configured.")
+    kwargs: dict[str, Any] = {
+        "connect_timeout": max(1, int(NEW_API_LOG_QUERY_TIMEOUT_SECONDS)),
+        "options": f"-c statement_timeout={max(1, int(NEW_API_LOG_QUERY_TIMEOUT_SECONDS * 1000))}",
+    }
+    if row_factory is not None:
+        kwargs["row_factory"] = row_factory
+    return psycopg.connect(NEW_API_LOG_DATABASE_URL, **kwargs)
+
+
+def qmark_to_psycopg(sql: str) -> str:
+    return sql.replace("?", "%s")
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"encoding": "base64", "text": base64.b64encode(value).decode("ascii")}
+    return str(value)
+
+
+def json_dumps(value: Any, *, indent: int | None = None) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=indent, default=json_safe)
+
+
+def limited_json_dumps(value: Any, max_bytes: int = NEW_API_LOG_MAX_JSON_BYTES) -> tuple[str, bool]:
+    text = json_dumps(value, indent=2)
+    encoded = text.encode("utf-8")
+    if max_bytes <= 0 or len(encoded) <= max_bytes:
+        return text, False
+    clipped = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return clipped + "\n\n... new-api-log 内容过大，已截断 ...", True
+
+
+class ExecuteResult:
+    def __init__(self, lastrowid: int | None = None) -> None:
+        self.lastrowid = lastrowid
+
+
 def ensure_db() -> None:
     global DB_INITIALIZED
     if DB_INITIALIZED:
@@ -77,12 +220,22 @@ def ensure_db() -> None:
     with DB_INIT_LOCK:
         if DB_INITIALIZED:
             return
-        os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-        with sqlite3.connect(DATABASE_PATH) as conn:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute(
+        if using_postgres():
+            ensure_postgres_db()
+        else:
+            ensure_sqlite_db()
+        DB_INITIALIZED = True
+
+
+def ensure_sqlite_db() -> None:
+    database_dir = os.path.dirname(DATABASE_PATH)
+    if database_dir:
+        os.makedirs(database_dir, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS request_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,22 +258,84 @@ def ensure_db() -> None:
                     access_key TEXT
                 )
                 """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
+        for column_name, column_type in (
+            ("upstream_duration_ms", "INTEGER"),
+            ("first_byte_ms", "INTEGER"),
+            ("output_tokens", "INTEGER"),
+            ("access_key", "TEXT"),
+            ("reasoning_tokens", "INTEGER"),
+            ("api_type", "TEXT"),
+            ("oneapi_request_id", "TEXT"),
+            ("new_api_user", "TEXT"),
+            ("new_api_log", "TEXT"),
+            ("new_api_log_error", "TEXT"),
+        ):
+            if column_name not in columns:
+                conn.execute(f"ALTER TABLE request_logs ADD COLUMN {column_name} {column_type}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
+
+
+def ensure_postgres_db() -> None:
+    with connect_gateway_postgres() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    client_host TEXT,
+                    request_headers TEXT NOT NULL,
+                    request_body BYTEA NOT NULL,
+                    request_body_truncated INTEGER NOT NULL DEFAULT 0,
+                    response_status INTEGER,
+                    response_headers TEXT,
+                    response_body BYTEA NOT NULL DEFAULT ''::bytea,
+                    response_body_truncated INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    duration_ms INTEGER,
+                    upstream_duration_ms INTEGER,
+                    first_byte_ms INTEGER,
+                    output_tokens INTEGER,
+                    access_key TEXT,
+                    reasoning_tokens INTEGER,
+                    api_type TEXT,
+                    oneapi_request_id TEXT,
+                    new_api_user TEXT,
+                    new_api_log TEXT,
+                    new_api_log_error TEXT
+                )
+                """
             )
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
-            if "upstream_duration_ms" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN upstream_duration_ms INTEGER")
-            if "first_byte_ms" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN first_byte_ms INTEGER")
-            if "output_tokens" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER")
-            if "access_key" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN access_key TEXT")
-            if "reasoning_tokens" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER")
-            if "api_type" not in columns:
-                conn.execute("ALTER TABLE request_logs ADD COLUMN api_type TEXT")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
-        DB_INITIALIZED = True
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'request_logs'
+                """
+            )
+            columns = {row[0] for row in cur.fetchall()}
+            for column_name, column_type in (
+                ("upstream_duration_ms", "INTEGER"),
+                ("first_byte_ms", "INTEGER"),
+                ("output_tokens", "INTEGER"),
+                ("access_key", "TEXT"),
+                ("reasoning_tokens", "INTEGER"),
+                ("api_type", "TEXT"),
+                ("oneapi_request_id", "TEXT"),
+                ("new_api_user", "TEXT"),
+                ("new_api_log", "TEXT"),
+                ("new_api_log_error", "TEXT"),
+            ):
+                if column_name not in columns:
+                    cur.execute(f"ALTER TABLE request_logs ADD COLUMN {column_name} {column_type}")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
+        conn.commit()
 
 
 @app.on_event("startup")
@@ -128,16 +343,76 @@ async def startup() -> None:
     ensure_db()
 
 
-def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
+def db_execute(sql: str, params: tuple = (), *, returning_id: bool = False) -> ExecuteResult:
     ensure_db()
+    if using_postgres():
+        postgres_sql = qmark_to_psycopg(sql)
+        if returning_id:
+            postgres_sql = postgres_sql.rstrip() + " RETURNING id"
+        with connect_gateway_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(postgres_sql, params)
+                lastrowid = None
+                if returning_id:
+                    row = cur.fetchone()
+                    lastrowid = int(row[0]) if row else None
+            conn.commit()
+        return ExecuteResult(lastrowid)
+
     conn = sqlite3.connect(DATABASE_PATH)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         cur = conn.execute(sql, params)
         conn.commit()
-        return cur
+        return ExecuteResult(int(cur.lastrowid) if returning_id else None)
     finally:
         conn.close()
+
+
+def db_fetchone(sql: str, params: tuple = ()) -> dict[str, Any] | None:
+    ensure_db()
+    if using_postgres():
+        with connect_gateway_postgres(dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(qmark_to_psycopg(sql), params)
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        row = conn.execute(sql, params).fetchone()
+    return dict(row) if row else None
+
+
+def db_fetchall(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    ensure_db()
+    if using_postgres():
+        with connect_gateway_postgres(dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(qmark_to_psycopg(sql), params)
+                rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def bytes_from_db(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return bytes(value)
 
 
 def create_log(
@@ -167,8 +442,188 @@ def create_log(
             int(request_body_truncated),
             api_type_from_log(target_url, request_body, b""),
         ),
+        returning_id=True,
     )
     return int(cur.lastrowid)
+
+
+def header_value(headers: dict[str, str] | None, name: str) -> str | None:
+    if not headers:
+        return None
+    wanted = name.lower()
+    for key, value in headers.items():
+        if key.lower() == wanted:
+            value = str(value).strip()
+            return value or None
+    return None
+
+
+def quote_pg_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def qualified_table_name(schema: str, table: str) -> str:
+    return f"{quote_pg_identifier(schema)}.{quote_pg_identifier(table)}"
+
+
+def configured_new_api_tables() -> set[str]:
+    return {item.lower() for item in NEW_API_LOG_TABLES}
+
+
+def discover_new_api_log_schema() -> list[dict[str, Any]]:
+    global NEW_API_LOG_SCHEMA_CACHE
+    if NEW_API_LOG_SCHEMA_CACHE is not None:
+        return NEW_API_LOG_SCHEMA_CACHE
+    with NEW_API_LOG_SCHEMA_LOCK:
+        if NEW_API_LOG_SCHEMA_CACHE is not None:
+            return NEW_API_LOG_SCHEMA_CACHE
+        if not NEW_API_LOG_DATABASE_URL:
+            NEW_API_LOG_SCHEMA_CACHE = []
+            return NEW_API_LOG_SCHEMA_CACHE
+        configured_tables = configured_new_api_tables()
+        with connect_new_api_log_postgres(dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT table_schema, table_name, column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+                    ORDER BY table_schema, table_name, ordinal_position
+                    """
+                )
+                rows = cur.fetchall()
+        tables: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            schema = row["table_schema"]
+            table = row["table_name"]
+            table_key = table.lower()
+            qualified_key = f"{schema}.{table}".lower()
+            if configured_tables and table_key not in configured_tables and qualified_key not in configured_tables:
+                continue
+            entry = tables.setdefault((schema, table), {"schema": schema, "table": table, "columns": []})
+            entry["columns"].append({"name": row["column_name"], "type": row["data_type"]})
+        NEW_API_LOG_SCHEMA_CACHE = list(tables.values())
+        return NEW_API_LOG_SCHEMA_CACHE
+
+
+def new_api_request_columns(columns: list[dict[str, str]]) -> list[str]:
+    wanted = {item.lower() for item in NEW_API_LOG_REQUEST_ID_COLUMNS}
+    return [column["name"] for column in columns if column["name"].lower() in wanted]
+
+
+def sortable_new_api_column(columns: list[dict[str, str]]) -> str | None:
+    names = {column["name"].lower(): column["name"] for column in columns}
+    for candidate in ("created_at", "created_time", "createdat", "timestamp", "time", "id"):
+        if candidate in names:
+            return names[candidate]
+    return None
+
+
+def sanitize_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: json_safe(value) if isinstance(value, (bytes, datetime, date, Decimal)) else value for key, value in row.items()}
+
+
+def query_new_api_log(request_id: str | None) -> dict[str, Any] | None:
+    if not request_id:
+        return None
+    payload: dict[str, Any] = {
+        "enabled": bool(NEW_API_LOG_DATABASE_URL),
+        "request_id": request_id,
+        "queried_at": utc_now(),
+        "matches": [],
+        "errors": [],
+    }
+    if not NEW_API_LOG_DATABASE_URL:
+        payload["error"] = "NEW_API_LOG_DATABASE_URL 未配置"
+        return payload
+
+    started_at = time.perf_counter()
+    try:
+        schema = discover_new_api_log_schema()
+        payload["tables"] = [
+            {"table": f"{item['schema']}.{item['table']}", "columns": [column["name"] for column in item["columns"]]}
+            for item in schema
+        ]
+        with connect_new_api_log_postgres(dict_row) as conn:
+            with conn.cursor() as cur:
+                for table_info in schema:
+                    match_columns = new_api_request_columns(table_info["columns"])
+                    if not match_columns:
+                        continue
+                    sort_column = sortable_new_api_column(table_info["columns"])
+                    for match_column in match_columns:
+                        sql = (
+                            f"SELECT * FROM {qualified_table_name(table_info['schema'], table_info['table'])} "
+                            f"WHERE CAST({quote_pg_identifier(match_column)} AS TEXT) = %s"
+                        )
+                        if sort_column:
+                            sql += f" ORDER BY {quote_pg_identifier(sort_column)} DESC"
+                        sql += " LIMIT %s"
+                        try:
+                            cur.execute(sql, (request_id, NEW_API_LOG_MAX_ROWS_PER_TABLE))
+                            rows = cur.fetchall()
+                        except Exception as exc:
+                            payload["errors"].append(
+                                {
+                                    "table": f"{table_info['schema']}.{table_info['table']}",
+                                    "column": match_column,
+                                    "error": str(exc),
+                                }
+                            )
+                            continue
+                        for row in rows:
+                            payload["matches"].append(
+                                {
+                                    "table": f"{table_info['schema']}.{table_info['table']}",
+                                    "match_column": match_column,
+                                    "data": sanitize_row(dict(row)),
+                                }
+                            )
+        payload["duration_ms"] = int((time.perf_counter() - started_at) * 1000)
+    except Exception as exc:
+        payload["error"] = str(exc)
+        payload["duration_ms"] = int((time.perf_counter() - started_at) * 1000)
+    return payload
+
+
+def extract_new_api_user(payload: dict[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    user_keys = (
+        "username",
+        "user_name",
+        "user",
+        "email",
+        "name",
+        "token_name",
+        "key_name",
+        "api_key_name",
+        "channel_name",
+    )
+    id_keys = ("user_id", "userid", "uid", "token_id", "key_id")
+    for item in payload.get("matches", []):
+        data = item.get("data") or {}
+        name = next((str(data[key]).strip() for key in user_keys if data.get(key) not in (None, "")), "")
+        user_id = next((str(data[key]).strip() for key in id_keys if data.get(key) not in (None, "")), "")
+        if name and user_id:
+            return f"{name} #{user_id}"
+        if name:
+            return name
+        if user_id:
+            return f"#{user_id}"
+    return None
+
+
+def new_api_log_cache_fields(request_id: str | None) -> tuple[str | None, str | None, str | None]:
+    payload = query_new_api_log(request_id)
+    if not payload:
+        return None, None, None
+    user = extract_new_api_user(payload)
+    text, clipped = limited_json_dumps(payload)
+    error = payload.get("error") or "; ".join(item.get("error", "") for item in payload.get("errors", [])[:3] if item.get("error"))
+    if clipped:
+        error = (error + "; " if error else "") + "new-api-log cache clipped"
+    return user, text, error or None
 
 
 def finish_log(
@@ -182,7 +637,7 @@ def finish_log(
     finished_at: float | None = None,
     first_byte_at: float | None = None,
     error: str | None = None,
-) -> None:
+) -> str | None:
     finished_at = finished_at or time.perf_counter()
     upstream_duration_ms = None
     if upstream_started_at is not None:
@@ -194,6 +649,7 @@ def finish_log(
     output_tokens = output_tokens_from_body(response_bytes)
     reasoning_tokens = reasoning_tokens_from_body(response_bytes)
     response_api_type = api_type_from_body(response_bytes)
+    oneapi_request_id = header_value(response_headers, "x-oneapi-request-id")
     db_execute(
         """
         UPDATE request_logs
@@ -207,12 +663,13 @@ def finish_log(
             first_byte_ms = ?,
             output_tokens = ?,
             reasoning_tokens = ?,
-            api_type = COALESCE(?, api_type)
+            api_type = COALESCE(?, api_type),
+            oneapi_request_id = ?
         WHERE id = ?
         """,
         (
             status_code,
-            json.dumps(response_headers or {}, ensure_ascii=False, indent=2),
+            json_dumps(response_headers or {}, indent=2),
             response_bytes,
             int(response_body_truncated),
             error,
@@ -222,8 +679,22 @@ def finish_log(
             output_tokens,
             reasoning_tokens,
             response_api_type,
+            oneapi_request_id,
             log_id,
         ),
+    )
+    return oneapi_request_id
+
+
+def enrich_new_api_log(log_id: int, request_id: str) -> None:
+    new_api_user, new_api_log, new_api_log_error = new_api_log_cache_fields(request_id)
+    db_execute(
+        """
+        UPDATE request_logs
+        SET new_api_user = ?, new_api_log = ?, new_api_log_error = ?
+        WHERE id = ?
+        """,
+        (new_api_user, new_api_log, new_api_log_error, log_id),
     )
 
 
@@ -516,7 +987,7 @@ def tps_from_values(output_tokens: int | None, duration_ms: int | None, first_by
     return round(output_tokens / (generation_ms / 1000), 2)
 
 
-def row_to_summary(row: sqlite3.Row) -> dict:
+def row_to_summary(row: dict[str, Any]) -> dict:
     output_tokens = row["output_tokens"]
     return {
         "id": row["id"],
@@ -541,42 +1012,41 @@ def row_to_summary(row: sqlite3.Row) -> dict:
         "response_body_bytes": row["response_body_bytes"] or 0,
         "reasoning_tokens": row["reasoning_tokens"],
         "api_type": row["api_type"] or api_type_from_target_url(row["target_url"] or "") or "other",
+        "oneapi_request_id": row.get("oneapi_request_id"),
+        "new_api_user": row.get("new_api_user"),
+        "new_api_log_error": row.get("new_api_log_error"),
         "request_body_truncated": bool(row["request_body_truncated"]),
         "response_body_truncated": bool(row["response_body_truncated"]),
     }
 
 
 def log_access_key(log_id: int) -> str | None:
-    ensure_db()
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        row = conn.execute("SELECT access_key FROM request_logs WHERE id = ?", (log_id,)).fetchone()
-    return row[0] if row else None
+    row = db_fetchone("SELECT access_key FROM request_logs WHERE id = ?", (log_id,))
+    return row["access_key"] if row else None
 
 
 def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[dict]:
     limit = max(1, min(limit, 500))
     access_key = normalize_access_key(access_key)
-    ensure_db()
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
-        where_clause = "access_key IS NULL" if access_key is None else "access_key = ?"
-        params = () if access_key is None else (access_key,)
-        rows = conn.execute(
-            f"""
-            SELECT id, created_at, method, target_url, client_host, response_status,
-                   access_key, duration_ms, upstream_duration_ms, first_byte_ms,
-                   output_tokens, reasoning_tokens, api_type, error,
-                   length(request_body) AS request_body_bytes,
-                   length(response_body) AS response_body_bytes,
-                   request_body_truncated, response_body_truncated
-            FROM request_logs
-            WHERE {where_clause}
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (*params, limit),
-        ).fetchall()
+    where_clause = "access_key IS NULL" if access_key is None else "access_key = ?"
+    params = () if access_key is None else (access_key,)
+    byte_length = "octet_length" if using_postgres() else "length"
+    rows = db_fetchall(
+        f"""
+        SELECT id, created_at, method, target_url, client_host, response_status,
+               access_key, duration_ms, upstream_duration_ms, first_byte_ms,
+               output_tokens, reasoning_tokens, api_type, error,
+               oneapi_request_id, new_api_user, new_api_log_error,
+               {byte_length}(request_body) AS request_body_bytes,
+               {byte_length}(response_body) AS response_body_bytes,
+               request_body_truncated, response_body_truncated
+        FROM request_logs
+        WHERE {where_clause}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (*params, limit),
+    )
     return [row_to_summary(row) for row in rows]
 
 
@@ -605,9 +1075,12 @@ async def announce_created(log_id_task: asyncio.Task[int]) -> None:
 async def finish_log_async(log_id_task: asyncio.Task[int], *args) -> None:
     try:
         log_id = await log_id_task
-        await asyncio.to_thread(finish_log, log_id, *args)
+        request_id = await asyncio.to_thread(finish_log, log_id, *args)
         access_key = await asyncio.to_thread(log_access_key, log_id)
         await broadcast_logs(log_id, access_key)
+        if request_id and NEW_API_LOG_DATABASE_URL:
+            await asyncio.to_thread(enrich_new_api_log, log_id, request_id)
+            await broadcast_logs(log_id, access_key)
     except Exception as exc:
         print(f"Failed to finish log: {exc}", flush=True)
 
@@ -828,6 +1301,13 @@ async def dashboard() -> str:
       padding: 0 12px;
       font: inherit;
     }
+    .lookup-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+    }
+    .lookup-form input[type="search"] { height: 40px; }
+    .lookup-form button { min-height: 40px; padding: 0 12px; }
     .type-filter {
       display: grid;
       gap: 6px;
@@ -956,6 +1436,15 @@ async def dashboard() -> str:
       border-color: rgba(53, 183, 255, .34);
       background: rgba(53, 183, 255, .08);
     }
+    .badge.requester {
+      max-width: 150px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #fde68a;
+      border-color: rgba(253, 230, 138, .28);
+      background: rgba(253, 230, 138, .07);
+    }
     .url {
       color: var(--text);
       white-space: nowrap;
@@ -1014,6 +1503,22 @@ async def dashboard() -> str:
       color: var(--text);
       font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       overflow-wrap: anywhere;
+    }
+    .endpoint-context {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      color: var(--muted);
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    .endpoint-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .pill {
       display: inline-flex;
@@ -1344,6 +1849,40 @@ async def dashboard() -> str:
       box-shadow: inset 0 0 0 1px rgba(15, 118, 110, .18);
     }
     .secondary { color: var(--muted); }
+    dialog.data-dialog {
+      width: min(1040px, calc(100vw - 32px));
+      height: min(780px, calc(100dvh - 32px));
+      padding: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--text);
+      box-shadow: 0 28px 90px rgba(0, 0, 0, .62);
+      overflow: hidden;
+    }
+    dialog.data-dialog::backdrop { background: rgba(0, 0, 0, .72); }
+    .dialog-shell {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+    .dialog-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-raised);
+    }
+    .dialog-head h2 { font-size: 15px; }
+    .dialog-content {
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+    }
+    .dialog-content .json-viewer { max-height: none; }
     [hidden] { display: none !important; }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -1361,6 +1900,7 @@ async def dashboard() -> str:
       .detail { height: 100%; }
       .detail-topline,
       .detail-meta { grid-template-columns: 1fr; }
+      .endpoint-actions { justify-content: flex-start; }
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv-row { grid-template-columns: 1fr; }
       .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -1414,6 +1954,13 @@ async def dashboard() -> str:
             搜索请求
             <input id="search" name="gateway-search" type="search" autocomplete="off" placeholder="例如 /v1/chat/completions…" />
           </label>
+          <div class="type-filter">
+            <div class="type-filter-title">Request ID 反查</div>
+            <form class="lookup-form" id="lookupForm">
+              <input id="lookupInput" name="request-id" type="search" autocomplete="off" placeholder="x-oneapi-request-id" aria-label="Request ID" />
+              <button type="submit">查询</button>
+            </form>
+          </div>
           <div class="type-filter" aria-label="接口类型过滤">
             <div class="type-filter-title">接口类型</div>
             <div class="type-filter-options" role="group" aria-label="接口类型">
@@ -1435,6 +1982,15 @@ async def dashboard() -> str:
       </section>
     </main>
   </div>
+  <dialog class="data-dialog" id="dataDialog">
+    <div class="dialog-shell">
+      <div class="dialog-head">
+        <h2 id="dialogTitle">详情</h2>
+        <button id="dialogClose" type="button">关闭</button>
+      </div>
+      <div class="dialog-content" id="dialogContent"></div>
+    </div>
+  </dialog>
   <script>
     const listEl = document.getElementById('list');
     const detailEl = document.getElementById('detail');
@@ -1444,6 +2000,11 @@ async def dashboard() -> str:
     const totalCountEl = document.getElementById('totalCount');
     const successCountEl = document.getElementById('successCount');
     const errorCountEl = document.getElementById('errorCount');
+    const lookupForm = document.getElementById('lookupForm');
+    const lookupInput = document.getElementById('lookupInput');
+    const dataDialog = document.getElementById('dataDialog');
+    const dialogTitle = document.getElementById('dialogTitle');
+    const dialogContent = document.getElementById('dialogContent');
     const dateFormatter = new Intl.DateTimeFormat(navigator.languages, {
       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
@@ -1976,7 +2537,7 @@ async def dashboard() -> str:
       return rowsCache.filter(row => {
         if (activeApiTypeFilter && row.api_type !== activeApiTypeFilter) return false;
         if (!q) return true;
-        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)}`.toLowerCase().includes(q);
+        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)} ${row.oneapi_request_id ?? ''} ${row.new_api_user ?? ''}`.toLowerCase().includes(q);
       });
     }
 
@@ -2010,6 +2571,7 @@ async def dashboard() -> str:
             <span class="badge status ${statusClassForRow(row)}">${esc(statusLabel(row))}</span>
             <span class="badge api-type">${esc(apiTypeLabel(row.api_type))}</span>
             ${row.reasoning_tokens === 516 ? '<span class="badge anomaly" title="reasoning_tokens 异常">516</span>' : ''}
+            ${row.new_api_user ? `<span class="badge requester" title="${esc(row.new_api_user)}">${esc(row.new_api_user)}</span>` : ''}
             <span class="grow"></span>
             <span>${esc(formatMs(row.duration_ms))}</span>
           </div>
@@ -2176,6 +2738,46 @@ async def dashboard() -> str:
       }
     }
 
+    function openDataDialog(title, loadingText = '正在加载…') {
+      dialogTitle.textContent = title;
+      dialogContent.innerHTML = `<div class="empty">${esc(loadingText)}</div>`;
+      if (typeof dataDialog.showModal === 'function') {
+        if (!dataDialog.open) dataDialog.showModal();
+      } else {
+        dataDialog.setAttribute('open', '');
+      }
+    }
+
+    function renderDialogPayload(payload) {
+      dialogContent.innerHTML = renderBodyContent(JSON.stringify(payload ?? {}, null, 2));
+    }
+
+    async function loadNewApiDetail(logId, requestId) {
+      openDataDialog(`new-api 请求详情 · ${requestId}`);
+      try {
+        const res = await fetch(`${apiBase}/api/logs/${logId}/new-api`);
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+        renderDialogPayload(payload);
+      } catch (error) {
+        dialogContent.innerHTML = `<div class="empty">加载失败：${esc(String(error.message || error))}</div>`;
+      }
+    }
+
+    async function lookupRequestId(requestId) {
+      const value = String(requestId || '').trim();
+      if (!value) return;
+      openDataDialog(`Request ID 反查 · ${value}`);
+      try {
+        const res = await fetch(`${apiBase}/api/request-lookup/${encodeURIComponent(value)}`);
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+        renderDialogPayload(payload);
+      } catch (error) {
+        dialogContent.innerHTML = `<div class="empty">查询失败：${esc(String(error.message || error))}</div>`;
+      }
+    }
+
     async function loadDetail(id, shouldFocus = true) {
       activeId = id;
       renderList();
@@ -2220,8 +2822,17 @@ async def dashboard() -> str:
                 ${isReasoningAnomaly ? '<span class="pill status-pill err">reasoning 516</span>' : ''}
               </div>
               <div class="endpoint-url" translate="no">${esc(row.target_url)}</div>
+              ${(row.oneapi_request_id || row.new_api_user) ? `
+                <div class="endpoint-context">
+                  ${row.oneapi_request_id ? `<span>Request ID: ${esc(row.oneapi_request_id)}</span>` : ''}
+                  ${row.new_api_user ? `<span>请求人: ${esc(row.new_api_user)}</span>` : ''}
+                </div>
+              ` : ''}
             </div>
-            <button type="button" data-copy="url">复制 URL</button>
+            <div class="endpoint-actions">
+              ${row.oneapi_request_id ? '<button type="button" data-new-api-detail>new-api 详情</button>' : ''}
+              <button type="button" data-copy="url">复制 URL</button>
+            </div>
           </div>
           <div class="metric-grid" aria-label="请求关键指标">
             <div class="metric-card primary"><div class="metric-label">本项目耗时</div><div class="metric-value">${esc(formatMs(row.duration_ms))}</div></div>
@@ -2329,6 +2940,9 @@ async def dashboard() -> str:
       detailEl.querySelectorAll('[data-response-view-button]').forEach(button => {
         button.addEventListener('click', () => setResponseBodyView(button.dataset.responseViewButton));
       });
+      detailEl.querySelector('[data-new-api-detail]')?.addEventListener('click', () => {
+        loadNewApiDetail(row.id, row.oneapi_request_id);
+      });
       setRequestBodyView(activeRequestBodyView);
       setResponseBodyView(activeResponseBodyView);
       setTab(['request', 'response'].includes(activeTab) ? activeTab : 'request');
@@ -2352,6 +2966,14 @@ async def dashboard() -> str:
         renderList();
         updateUrlState();
       });
+    });
+    lookupForm.addEventListener('submit', event => {
+      event.preventDefault();
+      lookupRequestId(lookupInput.value);
+    });
+    document.getElementById('dialogClose').addEventListener('click', () => dataDialog.close());
+    dataDialog.addEventListener('click', event => {
+      if (event.target === dataDialog) dataDialog.close();
     });
     document.getElementById('refresh').addEventListener('click', () => loadList({ refreshDetail: true }));
     loadList({ refreshDetail: true });
@@ -2417,56 +3039,165 @@ async def scoped_api_log_detail(access_key: str, log_id: int) -> JSONResponse:
     return await asyncio.to_thread(log_detail_response, log_id, access_key)
 
 
-def log_detail_response(log_id: int, access_key: str | None = None) -> JSONResponse:
+def json_object_from_text(value: Any, fallback: Any) -> Any:
+    if value in (None, ""):
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def log_row_by_id(log_id: int, access_key: str | None = None) -> dict[str, Any] | None:
     access_key = normalize_access_key(access_key)
-    ensure_db()
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT * FROM request_logs
-            WHERE id = ? AND ((? IS NULL AND access_key IS NULL) OR access_key = ?)
-            """,
-            (log_id, access_key, access_key),
-        ).fetchone()
+    if access_key is None:
+        return db_fetchone("SELECT * FROM request_logs WHERE id = ? AND access_key IS NULL", (log_id,))
+    return db_fetchone("SELECT * FROM request_logs WHERE id = ? AND access_key = ?", (log_id, access_key))
+
+
+def log_row_payload(row: dict[str, Any]) -> dict[str, Any]:
+    response_body = bytes_from_db(row.get("response_body"))
+    request_body = bytes_from_db(row.get("request_body"))
+    output_tokens = row.get("output_tokens")
+    if output_tokens is None:
+        output_tokens = output_tokens_from_body(response_body)
+    reasoning_tokens = row.get("reasoning_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = reasoning_tokens_from_body(response_body)
+    api_type = row.get("api_type") or api_type_from_log(row.get("target_url") or "", request_body, response_body)
+    new_api_log = json_object_from_text(row.get("new_api_log"), None)
+    if new_api_log is None and row.get("new_api_log"):
+        new_api_log = {"raw": str(row["new_api_log"]), "clipped": True}
+    duration_ms = row.get("duration_ms")
+    upstream_duration_ms = row.get("upstream_duration_ms")
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "method": row["method"],
+        "target_url": row["target_url"],
+        "access_key": row.get("access_key"),
+        "client_host": row.get("client_host"),
+        "request_headers": json_object_from_text(row.get("request_headers"), {}),
+        "request_body": body_payload(request_body),
+        "request_body_truncated": bool(row.get("request_body_truncated")),
+        "response_status": row.get("response_status"),
+        "response_headers": json_object_from_text(row.get("response_headers"), {}),
+        "response_body": body_payload(response_body),
+        "response_body_truncated": bool(row.get("response_body_truncated")),
+        "reasoning_tokens": reasoning_tokens,
+        "api_type": api_type,
+        "error": row.get("error"),
+        "duration_ms": duration_ms,
+        "upstream_duration_ms": upstream_duration_ms,
+        "first_byte_ms": row.get("first_byte_ms"),
+        "output_tokens": output_tokens,
+        "tps": tps_from_values(output_tokens, duration_ms, row.get("first_byte_ms")),
+        "gateway_overhead_ms": (
+            duration_ms - upstream_duration_ms
+            if duration_ms is not None and upstream_duration_ms is not None
+            else None
+        ),
+        "oneapi_request_id": row.get("oneapi_request_id"),
+        "new_api_user": row.get("new_api_user"),
+        "new_api_log": new_api_log,
+        "new_api_log_error": row.get("new_api_log_error"),
+    }
+
+
+def log_detail_response(log_id: int, access_key: str | None = None) -> JSONResponse:
+    row = log_row_by_id(log_id, access_key)
     if row is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(log_row_payload(row))
 
-    response_body = row["response_body"] or b""
-    request_body = row["request_body"] or b""
-    output_tokens = row["output_tokens"] if row["output_tokens"] is not None else output_tokens_from_body(response_body)
-    reasoning_tokens = row["reasoning_tokens"] if row["reasoning_tokens"] is not None else reasoning_tokens_from_body(response_body)
-    api_type = row["api_type"] or api_type_from_log(row["target_url"] or "", request_body, response_body)
+
+def gateway_logs_by_request_id(request_id: str, access_key: str | None = None) -> list[dict[str, Any]]:
+    access_key = normalize_access_key(access_key)
+    request_id = request_id.strip()
+    header_pattern = f"%{request_id}%"
+    if access_key is None:
+        rows = db_fetchall(
+            """
+            SELECT * FROM request_logs
+            WHERE access_key IS NULL AND (oneapi_request_id = ? OR response_headers LIKE ?)
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (request_id, header_pattern),
+        )
+    else:
+        rows = db_fetchall(
+            """
+            SELECT * FROM request_logs
+            WHERE access_key = ? AND (oneapi_request_id = ? OR response_headers LIKE ?)
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (access_key, request_id, header_pattern),
+        )
+    return [log_row_payload(row) for row in rows]
+
+
+def cached_new_api_log(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row or not row.get("new_api_log"):
+        return None
+    parsed = json_object_from_text(row["new_api_log"], None)
+    return parsed if isinstance(parsed, dict) else {"raw": str(row["new_api_log"])}
+
+
+def new_api_log_detail_response(log_id: int, access_key: str | None = None) -> JSONResponse:
+    row = log_row_by_id(log_id, access_key)
+    if row is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    request_id = row.get("oneapi_request_id")
+    if not request_id:
+        return JSONResponse({"error": "response header 中没有 x-oneapi-request-id"}, status_code=404)
+    payload = cached_new_api_log(row)
+    if payload is None:
+        payload = query_new_api_log(request_id)
+    return JSONResponse(payload or {"request_id": request_id, "matches": []})
+
+
+def request_lookup_response(request_id: str, access_key: str | None = None) -> JSONResponse:
+    request_id = request_id.strip()
+    if not request_id or len(request_id) > 256:
+        return JSONResponse({"error": "invalid request id"}, status_code=400)
+    gateway_logs = gateway_logs_by_request_id(request_id, access_key)
+    new_api_log = query_new_api_log(request_id)
+    if (not new_api_log or not new_api_log.get("matches")) and gateway_logs:
+        cached = gateway_logs[0].get("new_api_log")
+        if cached:
+            new_api_log = cached
     return JSONResponse(
         {
-            "id": row["id"],
-            "created_at": row["created_at"],
-            "method": row["method"],
-            "target_url": row["target_url"],
-            "access_key": row["access_key"],
-            "client_host": row["client_host"],
-            "request_headers": json.loads(row["request_headers"] or "{}"),
-            "request_body": body_payload(request_body),
-            "request_body_truncated": bool(row["request_body_truncated"]),
-            "response_status": row["response_status"],
-            "response_headers": json.loads(row["response_headers"] or "{}"),
-            "response_body": body_payload(response_body),
-            "response_body_truncated": bool(row["response_body_truncated"]),
-            "reasoning_tokens": reasoning_tokens,
-            "api_type": api_type,
-            "error": row["error"],
-            "duration_ms": row["duration_ms"],
-            "upstream_duration_ms": row["upstream_duration_ms"],
-            "first_byte_ms": row["first_byte_ms"],
-            "output_tokens": output_tokens,
-            "tps": tps_from_values(output_tokens, row["duration_ms"], row["first_byte_ms"]),
-            "gateway_overhead_ms": (
-                row["duration_ms"] - row["upstream_duration_ms"]
-                if row["duration_ms"] is not None and row["upstream_duration_ms"] is not None
-                else None
-            ),
+            "request_id": request_id,
+            "gateway_count": len(gateway_logs),
+            "gateway_logs": gateway_logs,
+            "new_api_log": new_api_log,
         }
     )
+
+
+@app.get("/api/logs/{log_id}/new-api")
+async def api_log_new_api_detail(log_id: int) -> JSONResponse:
+    return await asyncio.to_thread(new_api_log_detail_response, log_id, None)
+
+
+@app.get("/{access_key}/api/logs/{log_id}/new-api")
+async def scoped_api_log_new_api_detail(access_key: str, log_id: int) -> JSONResponse:
+    return await asyncio.to_thread(new_api_log_detail_response, log_id, access_key)
+
+
+@app.get("/api/request-lookup/{request_id}")
+async def api_request_lookup(request_id: str) -> JSONResponse:
+    return await asyncio.to_thread(request_lookup_response, request_id, None)
+
+
+@app.get("/{access_key}/api/request-lookup/{request_id}")
+async def scoped_api_request_lookup(access_key: str, request_id: str) -> JSONResponse:
+    return await asyncio.to_thread(request_lookup_response, request_id, access_key)
 
 
 @app.get("/{access_key}", response_class=HTMLResponse)
