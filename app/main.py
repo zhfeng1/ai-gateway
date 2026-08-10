@@ -323,13 +323,41 @@ def ensure_sqlite_db() -> None:
             if column_name not in columns:
                 conn.execute(f"ALTER TABLE request_logs ADD COLUMN {column_name} {column_type}")
         if backfill_response_failed:
-            conn.execute(
+            candidate_rows = conn.execute(
                 """
-                UPDATE request_logs
-                SET response_failed = 1
-                WHERE instr(CAST(response_body AS TEXT), 'event: response.failed') > 0
+                SELECT id, response_body
+                FROM request_logs
+                WHERE instr(CAST(response_body AS TEXT), 'event: response.failed' || char(10) || 'data:') > 0
+                   OR instr(CAST(response_body AS TEXT), 'event: response.failed' || char(13) || char(10) || 'data:') > 0
                 """
-            )
+            ).fetchall()
+        else:
+            candidate_rows = conn.execute(
+                """
+                SELECT id, response_body
+                FROM request_logs
+                WHERE response_failed = 1 AND response_failure_code IS NULL
+                """
+            ).fetchall()
+        for log_id, response_body in candidate_rows:
+            response_failure = response_failed_from_sse(response_body)
+            if response_failure:
+                conn.execute(
+                    """
+                    UPDATE request_logs
+                    SET response_failed = 1,
+                        response_failure_code = ?,
+                        response_failure_message = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(response_failure.get("code") or response_failure.get("type") or "response_failed"),
+                        str(response_failure.get("message") or json_dumps(response_failure)),
+                        log_id,
+                    ),
+                )
+            elif not backfill_response_failed:
+                conn.execute("UPDATE request_logs SET response_failed = 0 WHERE id = ?", (log_id,))
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
 
@@ -399,11 +427,39 @@ def ensure_postgres_db() -> None:
             if backfill_response_failed:
                 cur.execute(
                     """
-                    UPDATE request_logs
-                    SET response_failed = 1
-                    WHERE position(convert_to('event: response.failed', 'UTF8') in response_body) > 0
+                    SELECT id, response_body
+                    FROM request_logs
+                    WHERE position(convert_to(E'event: response.failed\ndata:', 'UTF8') in response_body) > 0
+                       OR position(convert_to(E'event: response.failed\r\ndata:', 'UTF8') in response_body) > 0
                     """
                 )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, response_body
+                    FROM request_logs
+                    WHERE response_failed = 1 AND response_failure_code IS NULL
+                    """
+                )
+            for log_id, response_body in cur.fetchall():
+                response_failure = response_failed_from_sse(response_body)
+                if response_failure:
+                    cur.execute(
+                        """
+                        UPDATE request_logs
+                        SET response_failed = 1,
+                            response_failure_code = %s,
+                            response_failure_message = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            str(response_failure.get("code") or response_failure.get("type") or "response_failed"),
+                            str(response_failure.get("message") or json_dumps(response_failure)),
+                            log_id,
+                        ),
+                    )
+                elif not backfill_response_failed:
+                    cur.execute("UPDATE request_logs SET response_failed = 0 WHERE id = %s", (log_id,))
             cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
         conn.commit()
