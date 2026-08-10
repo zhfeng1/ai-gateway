@@ -2040,12 +2040,209 @@ async def dashboard() -> str:
       background: var(--panel-raised);
     }
     .dialog-head h2 { font-size: 15px; }
+    .dialog-head button { min-height: 44px; }
     .dialog-content {
       min-height: 0;
       overflow: auto;
       padding: 14px;
     }
     .dialog-content .json-viewer { max-height: none; }
+    .parse-input-button {
+      min-height: 44px;
+      border-color: rgba(53, 183, 255, .34);
+      color: #bde9ff;
+      background: rgba(53, 183, 255, .09);
+    }
+    .parse-input-button:hover {
+      border-color: rgba(53, 183, 255, .58);
+      color: #e4f7ff;
+      background: rgba(53, 183, 255, .15);
+      box-shadow: 0 0 0 3px rgba(53, 183, 255, .07);
+    }
+    .input-dialog-intro {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+      padding: 14px 16px;
+      border: 1px solid rgba(53, 183, 255, .28);
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(53, 183, 255, .10), rgba(39, 209, 127, .055));
+    }
+    .input-dialog-intro h3 {
+      margin: 0 0 5px;
+      color: var(--text);
+      font-size: 14px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .input-dialog-intro p {
+      max-width: 680px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .input-summary {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+      flex: 0 0 auto;
+      flex-wrap: wrap;
+    }
+    .input-summary .pill { min-height: 26px; }
+    .input-timeline {
+      position: relative;
+      display: grid;
+      gap: 12px;
+    }
+    .input-timeline::before {
+      content: "";
+      position: absolute;
+      top: 18px;
+      bottom: 18px;
+      left: 17px;
+      width: 1px;
+      background: linear-gradient(var(--accent-2), rgba(39, 209, 127, .28));
+    }
+    .input-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+    }
+    .input-item-index {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid rgba(53, 183, 255, .48);
+      border-radius: 999px;
+      color: #dff6ff;
+      background: #101824;
+      box-shadow: 0 0 0 4px var(--panel), 0 0 18px rgba(53, 183, 255, .12);
+      font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .input-item.tool .input-item-index {
+      border-color: rgba(245, 184, 75, .52);
+      color: #fff0c7;
+    }
+    .input-item.output .input-item-index {
+      border-color: rgba(51, 209, 122, .48);
+      color: #d9fbe7;
+    }
+    .input-item-card {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(5, 7, 11, .34);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025);
+    }
+    .input-item-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(25, 34, 49, .78);
+    }
+    .input-item-title {
+      min-width: 0;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+    .input-item-meta {
+      display: flex;
+      justify-content: flex-end;
+      gap: 5px;
+      flex-wrap: wrap;
+    }
+    .input-item-meta .pill {
+      min-height: 22px;
+      padding: 0 7px;
+      font-size: 10px;
+    }
+    .input-item-body {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+    }
+    .input-content-list,
+    .input-field-list {
+      display: grid;
+      gap: 8px;
+    }
+    .input-content-block,
+    .input-field {
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid rgba(61, 75, 99, .62);
+      border-radius: 10px;
+      background: rgba(16, 21, 31, .7);
+    }
+    .input-content-label,
+    .input-field-label {
+      padding: 7px 10px;
+      border-bottom: 1px solid rgba(61, 75, 99, .52);
+      color: var(--muted);
+      background: rgba(25, 34, 49, .62);
+      font: 700 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: .025em;
+      overflow-wrap: anywhere;
+    }
+    .input-content-value,
+    .input-field-value {
+      min-width: 0;
+      padding: 10px;
+      color: var(--muted-strong);
+      overflow-wrap: anywhere;
+    }
+    .input-content-value.text,
+    .input-field-value.text {
+      color: var(--text);
+      font: 13px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .input-content-value > .json-viewer,
+    .input-field-value > .json-viewer {
+      margin: -10px;
+      border: 0;
+      border-radius: 0;
+    }
+    details.input-raw {
+      border-top: 1px solid var(--line);
+      background: rgba(5, 7, 11, .24);
+    }
+    details.input-raw summary {
+      min-height: 44px;
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 700;
+      list-style: none;
+    }
+    details.input-raw summary::-webkit-details-marker { display: none; }
+    details.input-raw summary::before {
+      content: "▶";
+      color: var(--accent-2);
+      font-size: 9px;
+    }
+    details.input-raw[open] summary::before { content: "▼"; }
+    .input-raw-content { padding: 0 12px 12px; }
+    .input-raw-content .json-viewer { max-height: 460px; }
     .record-list {
       display: grid;
       gap: 12px;
@@ -2093,6 +2290,10 @@ async def dashboard() -> str:
       .kv-row { grid-template-columns: 1fr; }
       .record-block .kv-row { grid-template-columns: 1fr; }
       .kv-key { border-right: 0; border-bottom: 1px solid var(--line); }
+      .input-dialog-intro { display: grid; }
+      .input-summary { justify-content: flex-start; }
+      .input-item-head { display: grid; }
+      .input-item-meta { justify-content: flex-start; }
     }
     @media (min-width: 821px) and (max-width: 1180px) {
       .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -2174,7 +2375,7 @@ async def dashboard() -> str:
       </section>
     </main>
   </div>
-  <dialog class="data-dialog" id="dataDialog">
+  <dialog class="data-dialog" id="dataDialog" aria-labelledby="dialogTitle">
     <div class="dialog-shell">
       <div class="dialog-head">
         <h2 id="dialogTitle">详情</h2>
@@ -2941,6 +3142,213 @@ async def dashboard() -> str:
       }
     }
 
+    const responsesInputTypeLabels = {
+      message: '消息',
+      reasoning: '推理',
+      function_call: '函数调用',
+      function_call_output: '函数结果',
+      custom_tool_call: '自定义工具调用',
+      custom_tool_call_output: '自定义工具结果',
+      web_search_call: '网页搜索',
+      file_search_call: '文件搜索',
+      computer_call: '计算机调用',
+      computer_call_output: '计算机调用结果',
+      code_interpreter_call: '代码解释器调用',
+      image_generation_call: '图片生成调用',
+      local_shell_call: '本地 Shell 调用',
+      local_shell_call_output: '本地 Shell 结果',
+      shell_call: 'Shell 调用',
+      shell_call_output: 'Shell 结果',
+      mcp_call: 'MCP 调用',
+      mcp_approval_request: 'MCP 授权请求',
+      mcp_approval_response: 'MCP 授权结果',
+      item_reference: '条目引用',
+    };
+
+    const responsesRoleLabels = {
+      system: 'System',
+      developer: 'Developer',
+      user: 'User',
+      assistant: 'Assistant',
+      tool: 'Tool',
+    };
+
+    function responsesInputTypeLabel(type) {
+      const value = String(type || 'item');
+      return responsesInputTypeLabels[value] || value;
+    }
+
+    function responsesInputCategory(item) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return 'other';
+      const type = String(item.type || '').toLowerCase();
+      if (type === 'message' || item.role) return 'message';
+      if (type.endsWith('_output') || type.endsWith('_response') || type.includes('result')) return 'output';
+      if (/(call|tool|search|computer|shell|interpreter|generation|mcp)/.test(type)) return 'tool';
+      return 'other';
+    }
+
+    function responsesInputItemTitle(item) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return 'Input 值';
+      const category = responsesInputCategory(item);
+      const type = String(item.type || (item.role ? 'message' : 'item'));
+      if (category === 'message') {
+        const role = responsesRoleLabels[item.role] || item.role || 'Unknown';
+        return `${role} 消息`;
+      }
+      const name = item.name || item.action?.type || item.action?.name;
+      return `${responsesInputTypeLabel(type)}${name ? ` · ${name}` : ''}`;
+    }
+
+    function responsesInputMeta(item) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+      const values = [
+        item.type ? ['type', item.type] : null,
+        item.role ? ['role', item.role] : null,
+        item.status ? ['status', item.status] : null,
+        item.call_id ? ['call', item.call_id] : null,
+        item.id ? ['id', item.id] : null,
+      ].filter(Boolean);
+      return values.map(([label, value]) => `<span class="pill" title="${esc(value)}">${esc(label)}: ${esc(value)}</span>`).join('');
+    }
+
+    function renderResponsesInputValue(value, key = '') {
+      if (value === null || value === undefined) return '<span class="secondary">null</span>';
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && value.length <= JSON_PARSE_MAX_CHARS) {
+          const parsed = tryParseJson(value);
+          if (parsed !== null) return renderBodyContent(JSON.stringify(parsed, null, 2));
+        }
+        const textClass = ['text', 'output', 'input_text', 'refusal', 'content'].includes(key) ? ' text' : '';
+        return `<div class="input-field-value${textClass}" translate="no">${esc(displayText(value, 80_000))}</div>`;
+      }
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        return `<div class="input-field-value" translate="no">${esc(value)}</div>`;
+      }
+      return `<div class="input-field-value">${renderBodyContent(JSON.stringify(value, null, 2))}</div>`;
+    }
+
+    function renderResponsesContentBlock(block, index) {
+      if (typeof block === 'string') {
+        return `
+          <div class="input-content-block">
+            <div class="input-content-label">内容 ${numberFormatter.format(index + 1)} · input_text</div>
+            <div class="input-content-value text" translate="no">${esc(displayText(block, 80_000))}</div>
+          </div>
+        `;
+      }
+      if (block === null || block === undefined || typeof block !== 'object') {
+        return `
+          <div class="input-content-block">
+            <div class="input-content-label">内容 ${numberFormatter.format(index + 1)}</div>
+            <div class="input-content-value" translate="no">${esc(String(block))}</div>
+          </div>
+        `;
+      }
+      const type = block.type || 'content';
+      const fields = Object.entries(block).filter(([key]) => key !== 'type');
+      return `
+        <div class="input-content-block">
+          <div class="input-content-label">内容 ${numberFormatter.format(index + 1)} · ${esc(type)}</div>
+          <div class="input-content-value">
+            ${fields.length ? `<div class="input-field-list">${fields.map(([key, value]) => `
+              <div class="input-field">
+                <div class="input-field-label">${esc(key)}</div>
+                ${renderResponsesInputValue(value, key)}
+              </div>
+            `).join('')}</div>` : '<span class="secondary">没有附加内容</span>'}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderResponsesMessageContent(content) {
+      const blocks = Array.isArray(content) ? content : [content];
+      if (!blocks.length) return '<div class="empty">消息内容为空</div>';
+      return `<div class="input-content-list">${blocks.map(renderResponsesContentBlock).join('')}</div>`;
+    }
+
+    function renderResponsesInputFields(item, excludedKeys = new Set()) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return `<div class="input-field-list"><div class="input-field">${renderResponsesInputValue(item, 'content')}</div></div>`;
+      }
+      const fields = Object.entries(item).filter(([key]) => !excludedKeys.has(key));
+      if (!fields.length) return '';
+      return `<div class="input-field-list">${fields.map(([key, value]) => `
+        <div class="input-field">
+          <div class="input-field-label">${esc(key)}</div>
+          ${renderResponsesInputValue(value, key)}
+        </div>
+      `).join('')}</div>`;
+    }
+
+    function renderResponsesInputItem(item, index) {
+      const category = responsesInputCategory(item);
+      const isMessage = category === 'message' && item && typeof item === 'object' && !Array.isArray(item);
+      const excluded = new Set(['type', 'role', 'status', 'call_id', 'id']);
+      if (isMessage) excluded.add('content');
+      const rawJson = JSON.stringify(item, null, 2) ?? String(item);
+      return `
+        <article class="input-item ${esc(category)}">
+          <div class="input-item-index" aria-label="第 ${numberFormatter.format(index + 1)} 项">${numberFormatter.format(index + 1)}</div>
+          <div class="input-item-card">
+            <div class="input-item-head">
+              <div class="input-item-title">${esc(responsesInputItemTitle(item))}</div>
+              <div class="input-item-meta">${responsesInputMeta(item)}</div>
+            </div>
+            <div class="input-item-body">
+              ${isMessage ? renderResponsesMessageContent(item.content) : ''}
+              ${renderResponsesInputFields(item, excluded)}
+              ${isMessage && item.content === undefined ? '<div class="empty">消息中没有 content 字段</div>' : ''}
+            </div>
+            <details class="input-raw">
+              <summary>查看原始 JSON</summary>
+              <div class="input-raw-content">${renderBodyContent(rawJson)}</div>
+            </details>
+          </div>
+        </article>
+      `;
+    }
+
+    function openResponsesInputDialog(requestBodyText, requestBodyTruncated = false) {
+      openDataDialog('OpenAI Responses · Input 解析', '正在解析 Input…');
+      const payload = tryParseJson(requestBodyText);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        dialogContent.innerHTML = '<div class="empty">Request Body 不是有效的 JSON 对象，无法解析 Responses Input。</div>';
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(payload, 'input')) {
+        dialogContent.innerHTML = '<div class="empty">Request Body 中没有找到 input 字段。</div>';
+        return;
+      }
+      const inputIsArray = Array.isArray(payload.input);
+      const items = inputIsArray ? payload.input : [payload.input];
+      const counts = items.reduce((result, item) => {
+        const category = responsesInputCategory(item);
+        result[category] = (result[category] || 0) + 1;
+        return result;
+      }, {});
+      const summary = [
+        ['消息', counts.message],
+        ['工具调用', counts.tool],
+        ['工具结果', counts.output],
+        ['其他', counts.other],
+      ].filter(([, count]) => count).map(([label, count]) => `<span class="pill">${label} ${numberFormatter.format(count)}</span>`).join('');
+      dialogContent.innerHTML = `
+        <div class="input-dialog-intro">
+          <div>
+            <h3>Input 时间线 · ${numberFormatter.format(items.length)} 项</h3>
+            <p>保持 input ${inputIsArray ? '数组' : '字段'}的原始顺序；每项末尾可展开完整 JSON，未知类型也会原样保留。${requestBodyTruncated ? '当前请求 Body 已被截断，末尾内容可能不完整。' : ''}</p>
+          </div>
+          <div class="input-summary" aria-label="Input 类型统计">
+            ${summary || '<span class="pill">空数组</span>'}
+          </div>
+        </div>
+        ${items.length ? `<div class="input-timeline">${items.map(renderResponsesInputItem).join('')}</div>` : '<div class="empty">input 数组为空</div>'}
+      `;
+      dialogContent.scrollTop = 0;
+    }
+
     const newApiColumnLabels = {
       id: '记录编号',
       user_id: '用户 ID',
@@ -3192,6 +3600,7 @@ async def dashboard() -> str:
             <div class="copy-row">
               <h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3>
               <div class="row-actions">
+                ${apiType === 'responses' ? '<button class="parse-input-button" type="button" data-responses-input>解析 Input</button>' : ''}
                 <div class="view-switch" aria-label="Request Body 视图">
                   <button type="button" data-request-view-button="json">JSON</button>
                   <button type="button" data-request-view-button="text">Text</button>
@@ -3272,6 +3681,9 @@ async def dashboard() -> str:
       });
       detailEl.querySelector('[data-new-api-detail]')?.addEventListener('click', () => {
         loadNewApiDetail(row.id, row.oneapi_request_id);
+      });
+      detailEl.querySelector('[data-responses-input]')?.addEventListener('click', () => {
+        openResponsesInputDialog(row.request_body.text, row.request_body_truncated);
       });
       setRequestBodyView(activeRequestBodyView);
       setResponseBodyView(activeResponseBodyView);

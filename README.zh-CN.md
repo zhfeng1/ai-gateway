@@ -78,6 +78,7 @@ http://127.0.0.1:20000/my-secret
 - 右侧展示请求摘要、状态码、耗时、上游耗时、差值、首字用时和 TPS。
 - Header 默认折叠，点击后以键值对形式查看。
 - JSON Body 使用可展开的树形预览。
+- Responses API 的 Request Body 支持按原始顺序解析 `input` 数组，以时间线展示消息、工具调用、工具结果及未知类型。
 - SSE Response 可以切换 JSON、Text、SSE 三种视图。
 - `reasoning_tokens = 516` 时会在列表和详情中标记异常。
 
