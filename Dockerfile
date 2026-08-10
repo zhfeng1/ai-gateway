@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM px.zhhf.de/python:3.12-slim
 
 ARG APP_COMMIT=unknown
 
