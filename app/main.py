@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from html import escape
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlsplit
 
@@ -27,6 +28,12 @@ DATABASE_TYPE = (os.getenv("DATABASE_TYPE") or os.getenv("DB_TYPE") or "sqlite")
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_DSN") or os.getenv("POSTGRES_URL")
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "600"))
 MAX_CAPTURE_BYTES = int(os.getenv("MAX_CAPTURE_BYTES", "0"))
+APP_COMMIT = (os.getenv("APP_COMMIT") or "unknown").strip() or "unknown"
+PERFORMANCE_LOG_ENABLED = os.getenv("PERFORMANCE_LOG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+PERFORMANCE_LOG_THRESHOLD_MS = int(float(os.getenv("PERFORMANCE_LOG_THRESHOLD_MS", "100")))
+HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "500"))
+HTTP_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "200"))
+HTTP_KEEPALIVE_EXPIRY_SECONDS = float(os.getenv("HTTP_KEEPALIVE_EXPIRY_SECONDS", "30"))
 POSTGRES_CONNECT_TIMEOUT_SECONDS = int(float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
 NEW_API_LOG_DATABASE_URL = (
     os.getenv("NEW_API_LOG_DATABASE_URL")
@@ -68,6 +75,7 @@ DB_INIT_LOCK = threading.Lock()
 DB_INITIALIZED = False
 NEW_API_LOG_SCHEMA_LOCK = threading.Lock()
 NEW_API_LOG_SCHEMA_CACHE: list[dict[str, Any]] | None = None
+HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
 class LogSocketManager:
@@ -99,6 +107,37 @@ log_socket_manager = LogSocketManager()
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def elapsed_ms(started_at: float, finished_at: float | None = None) -> int:
+    return int(((finished_at or time.perf_counter()) - started_at) * 1000)
+
+
+def perf_log(event: str, **fields: Any) -> None:
+    if not PERFORMANCE_LOG_ENABLED:
+        return
+    payload = {"event": event, "timestamp": utc_now(), **fields}
+    print(f"AI_GATEWAY_PERF {json_dumps(payload)}", flush=True)
+
+
+def create_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=30.0),
+        follow_redirects=False,
+        trust_env=False,
+        limits=httpx.Limits(
+            max_connections=HTTP_MAX_CONNECTIONS,
+            max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
+            keepalive_expiry=HTTP_KEEPALIVE_EXPIRY_SECONDS,
+        ),
+    )
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global HTTP_CLIENT
+    if HTTP_CLIENT is None or HTTP_CLIENT.is_closed:
+        HTTP_CLIENT = create_http_client()
+    return HTTP_CLIENT
 
 
 def normalize_postgres_dsn(value: str | None) -> str | None:
@@ -340,7 +379,17 @@ def ensure_postgres_db() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
+    global HTTP_CLIENT
     ensure_db()
+    HTTP_CLIENT = create_http_client()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global HTTP_CLIENT
+    if HTTP_CLIENT is not None and not HTTP_CLIENT.is_closed:
+        await HTTP_CLIENT.aclose()
+    HTTP_CLIENT = None
 
 
 def db_execute(sql: str, params: tuple = (), *, returning_id: bool = False) -> ExecuteResult:
@@ -445,6 +494,22 @@ def create_log(
         returning_id=True,
     )
     return int(cur.lastrowid)
+
+
+def update_request_body(log_id: int, target_url: str, request_body: bytes, request_body_truncated: bool) -> None:
+    db_execute(
+        """
+        UPDATE request_logs
+        SET request_body = ?, request_body_truncated = ?, api_type = ?
+        WHERE id = ?
+        """,
+        (
+            request_body,
+            int(request_body_truncated),
+            api_type_from_log(target_url, request_body, b""),
+            log_id,
+        ),
+    )
 
 
 def header_value(headers: dict[str, str] | None, name: str) -> str | None:
@@ -1072,17 +1137,91 @@ async def announce_created(log_id_task: asyncio.Task[int]) -> None:
         print(f"Failed to announce log creation: {exc}", flush=True)
 
 
-async def finish_log_async(log_id_task: asyncio.Task[int], *args) -> None:
+async def create_log_async_timed(perf_context: dict[str, Any], *args: Any) -> int:
+    started_at = time.perf_counter()
+    log_id = await asyncio.to_thread(create_log, *args)
+    perf_context["gateway_log_id"] = log_id
+    perf_context["db_create_ms"] = elapsed_ms(started_at)
+    return log_id
+
+
+async def persist_request_body_async(
+    log_id_task: asyncio.Task[int],
+    request_body_finished: asyncio.Event,
+    target_url: str,
+    request_capture: bytearray,
+    request_state: dict[str, Any],
+    perf_context: dict[str, Any],
+) -> None:
+    await request_body_finished.wait()
+    snapshot = bytes(request_capture)
+    log_id = await log_id_task
+    started_at = time.perf_counter()
+    await asyncio.to_thread(
+        update_request_body,
+        log_id,
+        target_url,
+        snapshot,
+        bool(request_state.get("truncated")),
+    )
+    perf_context["request_body_db_ms"] = elapsed_ms(started_at)
+
+
+async def finish_log_async(
+    log_id_task: asyncio.Task[int],
+    request_body_task: asyncio.Task[None] | None,
+    *args: Any,
+    perf_context: dict[str, Any] | None = None,
+) -> None:
+    perf_context = perf_context or {}
+    background_started_at = time.perf_counter()
     try:
         log_id = await log_id_task
+        if request_body_task is not None:
+            try:
+                await request_body_task
+            except Exception as exc:
+                perf_context["request_body_db_error"] = str(exc)
+                print(f"Failed to persist request body for log {log_id}: {exc}", flush=True)
+        db_finish_started_at = time.perf_counter()
         request_id = await asyncio.to_thread(finish_log, log_id, *args)
+        perf_context["db_finish_ms"] = elapsed_ms(db_finish_started_at)
         access_key = await asyncio.to_thread(log_access_key, log_id)
+        broadcast_started_at = time.perf_counter()
         await broadcast_logs(log_id, access_key)
+        perf_context["broadcast_ms"] = elapsed_ms(broadcast_started_at)
         if request_id and NEW_API_LOG_DATABASE_URL:
+            enrich_started_at = time.perf_counter()
             await asyncio.to_thread(enrich_new_api_log, log_id, request_id)
+            perf_context["new_api_enrich_ms"] = elapsed_ms(enrich_started_at)
             await broadcast_logs(log_id, access_key)
+        perf_context["background_total_ms"] = elapsed_ms(background_started_at)
+        background_slow = bool(perf_context.get("request_body_db_error")) or any(
+            int(perf_context.get(field) or 0) >= PERFORMANCE_LOG_THRESHOLD_MS
+            for field in ("db_create_ms", "request_body_db_ms", "db_finish_ms", "broadcast_ms", "new_api_enrich_ms")
+        )
+        if background_slow:
+            perf_log(
+                "background",
+                request_id=request_id,
+                gateway_log_id=log_id,
+                db_create_ms=perf_context.get("db_create_ms"),
+                request_body_db_ms=perf_context.get("request_body_db_ms"),
+                request_body_db_error=perf_context.get("request_body_db_error"),
+                db_finish_ms=perf_context.get("db_finish_ms"),
+                broadcast_ms=perf_context.get("broadcast_ms"),
+                new_api_enrich_ms=perf_context.get("new_api_enrich_ms"),
+                background_total_ms=perf_context.get("background_total_ms"),
+            )
     except Exception as exc:
         print(f"Failed to finish log: {exc}", flush=True)
+        perf_log(
+            "background_error",
+            request_id=perf_context.get("request_id"),
+            gateway_log_id=perf_context.get("gateway_log_id"),
+            error=str(exc),
+            background_total_ms=elapsed_ms(background_started_at),
+        )
 
 
 def body_payload(body: bytes) -> dict:
@@ -1189,6 +1328,24 @@ async def dashboard() -> str:
       gap: 10px;
       min-width: 0;
     }
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .commit-id {
+      max-width: 180px;
+      overflow: hidden;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(5, 7, 11, .34);
+      font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .mark {
       width: 36px;
       height: 36px;
@@ -1228,6 +1385,12 @@ async def dashboard() -> str:
       color: var(--accent);
       background: var(--accent-soft);
       box-shadow: 0 0 0 3px rgba(39, 209, 127, .06);
+    }
+    button:disabled {
+      cursor: wait;
+      opacity: .55;
+      color: var(--muted);
+      box-shadow: none;
     }
     button:focus-visible,
     input:focus-visible {
@@ -1964,7 +2127,10 @@ async def dashboard() -> str:
           </svg>
         </div>
         <div>
-          <h1 translate="no">AI Gateway</h1>
+          <div class="brand-title">
+            <h1 translate="no">AI Gateway</h1>
+            <span class="commit-id" title="部署 Commit：__APP_COMMIT_FULL__">commit __APP_COMMIT_SHORT__</span>
+          </div>
           <div class="subtitle">Realtime proxy inspector</div>
         </div>
       </div>
@@ -2028,6 +2194,7 @@ async def dashboard() -> str:
     const errorCountEl = document.getElementById('errorCount');
     const lookupForm = document.getElementById('lookupForm');
     const lookupInput = document.getElementById('lookupInput');
+    const lookupSubmit = lookupForm.querySelector('button[type="submit"]');
     const dataDialog = document.getElementById('dataDialog');
     const dialogTitle = document.getElementById('dialogTitle');
     const dialogContent = document.getElementById('dialogContent');
@@ -2774,10 +2941,6 @@ async def dashboard() -> str:
       }
     }
 
-    function renderDialogPayload(payload) {
-      dialogContent.innerHTML = renderBodyContent(JSON.stringify(payload ?? {}, null, 2));
-    }
-
     const newApiColumnLabels = {
       id: '记录编号',
       user_id: '用户 ID',
@@ -2842,7 +3005,7 @@ async def dashboard() -> str:
       return esc(value);
     }
 
-    function renderNewApiRecords(payload) {
+    function newApiRecordsMarkup(payload) {
       const records = [];
       const seen = new Set();
       for (const match of payload?.matches || []) {
@@ -2854,10 +3017,9 @@ async def dashboard() -> str:
         records.push(data);
       }
       if (!records.length) {
-        dialogContent.innerHTML = '<div class="empty">没有查询到对应的 new-api 日志记录</div>';
-        return;
+        return '<div class="empty">没有查询到对应的 new-api 日志记录</div>';
       }
-      dialogContent.innerHTML = `<div class="record-list">${records.map((record, index) => `
+      return `<div class="record-list">${records.map((record, index) => `
         <article class="record-block">
           <h3 class="record-title">日志记录 ${numberFormatter.format(index + 1)}</h3>
           <div class="kv">${sortedNewApiEntries(record).map(([key, value]) => `
@@ -2868,6 +3030,10 @@ async def dashboard() -> str:
           `).join('')}</div>
         </article>
       `).join('')}</div>`;
+    }
+
+    function renderNewApiRecords(payload) {
+      dialogContent.innerHTML = newApiRecordsMarkup(payload);
     }
 
     async function loadNewApiDetail(logId, requestId) {
@@ -2885,31 +3051,77 @@ async def dashboard() -> str:
     async function lookupRequestId(requestId) {
       const value = String(requestId || '').trim();
       if (!value) return;
-      openDataDialog(`Request ID 反查 · ${value}`);
+      if (dataDialog.open) dataDialog.close();
+      activeId = null;
+      activeDetailPending = false;
+      renderList();
+      detailEl.innerHTML = `<div class="empty">正在反查 Request ID：${esc(value)}</div>`;
+      lookupSubmit.disabled = true;
+      lookupSubmit.textContent = '查询中';
       try {
-        const res = await fetch(`${apiBase}/api/request-lookup/${encodeURIComponent(value)}`);
-        const payload = await res.json();
-        if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
-        renderDialogPayload(payload);
+        const lookupUrl = `${apiBase}/api/request-lookup/${encodeURIComponent(value)}`;
+        const gatewayRes = await fetch(`${lookupUrl}?include_new_api=false`);
+        let payload = await gatewayRes.json();
+        if (!gatewayRes.ok) throw new Error(payload.error || `HTTP ${gatewayRes.status}`);
+        const gatewayLog = Array.isArray(payload.gateway_logs) ? payload.gateway_logs[0] : null;
+        if (gatewayLog?.id) {
+          await loadDetail(Number(gatewayLog.id), true, gatewayLog);
+          liveTextEl.textContent = `已定位 Request ID：${value}`;
+          return;
+        }
+        detailEl.innerHTML = `<div class="empty">AI Gateway 中没有匹配，正在查询 new-api-log：${esc(value)}</div>`;
+        const newApiRes = await fetch(lookupUrl);
+        payload = await newApiRes.json();
+        if (!newApiRes.ok) throw new Error(payload.error || `HTTP ${newApiRes.status}`);
+        const newApiPayload = payload.new_api_log || {};
+        const hasNewApiRecords = Array.isArray(newApiPayload.matches)
+          && newApiPayload.matches.some(match => match?.data && typeof match.data === 'object');
+        detailEl.innerHTML = `
+          <div class="detail-head">
+            <div class="detail-topline">
+              <div class="endpoint-block">
+                <div class="endpoint-badges">
+                  <span class="pill type-pill">Request ID 反查</span>
+                  <span class="pill status-pill ${hasNewApiRecords ? 'warn' : 'err'}">${hasNewApiRecords ? '仅 new-api 记录' : '未找到匹配'}</span>
+                </div>
+                <div class="endpoint-context"><span>Request ID: ${esc(value)}</span></div>
+              </div>
+            </div>
+          </div>
+          ${hasNewApiRecords ? `
+            <section>
+              <div class="copy-row"><h3>new-api 日志</h3></div>
+              ${newApiRecordsMarkup(newApiPayload)}
+            </section>
+          ` : '<div class="empty">AI Gateway 和 new-api-log 中都没有找到该 Request ID，请检查 ID 是否完整。</div>'}
+        `;
+        detailEl.focus({ preventScroll: true });
+        liveTextEl.textContent = `已查询 Request ID：${value}`;
       } catch (error) {
-        dialogContent.innerHTML = `<div class="empty">查询失败：${esc(String(error.message || error))}</div>`;
+        detailEl.innerHTML = `<div class="empty">反查失败：${esc(String(error.message || error))}</div>`;
+        liveTextEl.textContent = 'Request ID 反查失败';
+      } finally {
+        lookupSubmit.disabled = false;
+        lookupSubmit.textContent = '查询';
       }
     }
 
-    async function loadDetail(id, shouldFocus = true) {
+    async function loadDetail(id, shouldFocus = true, providedRow = null) {
       activeId = id;
       renderList();
       detailEl.innerHTML = '<div class="empty">正在加载详情…</div>';
-      let row;
-      try {
-        const res = await fetch(`${apiBase}/api/logs/${id}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        row = await res.json();
-      } catch (error) {
-        activeDetailPending = false;
-        detailEl.innerHTML = `<div class="empty">详情加载失败：${esc(String(error.message || error))}</div>`;
-        liveTextEl.textContent = '详情加载失败';
-        return;
+      let row = providedRow;
+      if (!row) {
+        try {
+          const res = await fetch(`${apiBase}/api/logs/${id}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          row = await res.json();
+        } catch (error) {
+          activeDetailPending = false;
+          detailEl.innerHTML = `<div class="empty">详情加载失败：${esc(String(error.message || error))}</div>`;
+          liveTextEl.textContent = '详情加载失败';
+          return;
+        }
       }
       activeDetailPending = row.response_status === null && !row.error;
       const responseIsSse = isSseResponse(row);
@@ -3099,12 +3311,14 @@ async def dashboard() -> str:
   </script>
 </body>
 </html>
-"""
+""".replace("__APP_COMMIT_FULL__", escape(APP_COMMIT, quote=True)).replace(
+        "__APP_COMMIT_SHORT__", escape(APP_COMMIT[:12])
+    )
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "commit": APP_COMMIT}
 
 
 @app.get("/favicon.ico")
@@ -3234,27 +3448,55 @@ def log_detail_response(log_id: int, access_key: str | None = None) -> JSONRespo
 def gateway_logs_by_request_id(request_id: str, access_key: str | None = None) -> list[dict[str, Any]]:
     access_key = normalize_access_key(access_key)
     request_id = request_id.strip()
-    header_pattern = f"%{request_id}%"
     if access_key is None:
         rows = db_fetchall(
             """
             SELECT * FROM request_logs
-            WHERE access_key IS NULL AND (oneapi_request_id = ? OR response_headers LIKE ?)
+            WHERE access_key IS NULL AND oneapi_request_id = ?
             ORDER BY id DESC
             LIMIT 20
             """,
-            (request_id, header_pattern),
+            (request_id,),
         )
     else:
         rows = db_fetchall(
             """
             SELECT * FROM request_logs
-            WHERE access_key = ? AND (oneapi_request_id = ? OR response_headers LIKE ?)
+            WHERE access_key = ? AND oneapi_request_id = ?
             ORDER BY id DESC
             LIMIT 20
             """,
-            (access_key, request_id, header_pattern),
+            (access_key, request_id),
         )
+    if not rows:
+        header_pattern = f"%{request_id}%"
+        if access_key is None:
+            id_rows = db_fetchall(
+                """
+                SELECT id FROM request_logs
+                WHERE access_key IS NULL AND response_headers LIKE ?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (header_pattern,),
+            )
+        else:
+            id_rows = db_fetchall(
+                """
+                SELECT id FROM request_logs
+                WHERE access_key = ? AND response_headers LIKE ?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (access_key, header_pattern),
+            )
+        ids = [int(row["id"]) for row in id_rows]
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            rows = db_fetchall(
+                f"SELECT * FROM request_logs WHERE id IN ({placeholders}) ORDER BY id DESC",
+                tuple(ids),
+            )
     return [log_row_payload(row) for row in rows]
 
 
@@ -3278,16 +3520,20 @@ def new_api_log_detail_response(log_id: int, access_key: str | None = None) -> J
     return JSONResponse(payload or {"request_id": request_id, "matches": []})
 
 
-def request_lookup_response(request_id: str, access_key: str | None = None) -> JSONResponse:
+def request_lookup_response(
+    request_id: str,
+    access_key: str | None = None,
+    include_new_api: bool = True,
+) -> JSONResponse:
     request_id = request_id.strip()
     if not request_id or len(request_id) > 256:
         return JSONResponse({"error": "invalid request id"}, status_code=400)
     gateway_logs = gateway_logs_by_request_id(request_id, access_key)
-    new_api_log = query_new_api_log(request_id)
-    if (not new_api_log or not new_api_log.get("matches")) and gateway_logs:
-        cached = gateway_logs[0].get("new_api_log")
-        if cached:
-            new_api_log = cached
+    new_api_log = None
+    if gateway_logs:
+        new_api_log = gateway_logs[0].get("new_api_log")
+    if include_new_api and (not new_api_log or not new_api_log.get("matches")):
+        new_api_log = query_new_api_log(request_id)
     return JSONResponse(
         {
             "request_id": request_id,
@@ -3309,13 +3555,13 @@ async def scoped_api_log_new_api_detail(access_key: str, log_id: int) -> JSONRes
 
 
 @app.get("/api/request-lookup/{request_id}")
-async def api_request_lookup(request_id: str) -> JSONResponse:
-    return await asyncio.to_thread(request_lookup_response, request_id, None)
+async def api_request_lookup(request_id: str, include_new_api: bool = True) -> JSONResponse:
+    return await asyncio.to_thread(request_lookup_response, request_id, None, include_new_api)
 
 
 @app.get("/{access_key}/api/request-lookup/{request_id}")
-async def scoped_api_request_lookup(access_key: str, request_id: str) -> JSONResponse:
-    return await asyncio.to_thread(request_lookup_response, request_id, access_key)
+async def scoped_api_request_lookup(access_key: str, request_id: str, include_new_api: bool = True) -> JSONResponse:
+    return await asyncio.to_thread(request_lookup_response, request_id, access_key, include_new_api)
 
 
 @app.get("/{access_key}", response_class=HTMLResponse)
@@ -3347,43 +3593,99 @@ async def proxy_to_target(target_url: str, request: Request, access_key: str | N
         return PlainTextResponse(validation_error, status_code=400)
 
     started_at = time.perf_counter()
-    raw_request_body = await request.body()
-    captured_request_body, request_truncated = capture_bytes(raw_request_body)
+    perf_context: dict[str, Any] = {
+        "method": request.method,
+        "target_url": target_url,
+    }
+    request_capture = bytearray()
+    request_state: dict[str, Any] = {
+        "bytes_received": 0,
+        "truncated": False,
+        "first_chunk_at": None,
+        "finished_at": None,
+    }
+    request_body_finished = asyncio.Event()
     log_id_task = asyncio.create_task(
-        asyncio.to_thread(
-            create_log,
+        create_log_async_timed(
+            perf_context,
             request.method,
             target_url,
             access_key,
             request.client.host if request.client else None,
             dict(request.headers),
-            captured_request_body,
-            request_truncated,
+            b"",
+            False,
         )
     )
     asyncio.create_task(announce_created(log_id_task))
+    request_body_task = asyncio.create_task(
+        persist_request_body_async(
+            log_id_task,
+            request_body_finished,
+            target_url,
+            request_capture,
+            request_state,
+            perf_context,
+        )
+    )
     response_capture = bytearray()
     response_truncated = False
 
-    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=30.0)
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False)
+    content_length_header = request.headers.get("content-length")
+    transfer_encoding = request.headers.get("transfer-encoding")
+    has_request_body = (
+        (content_length_header is not None and content_length_header != "0")
+        or bool(transfer_encoding)
+        or request.method.upper() in {"POST", "PUT", "PATCH"}
+    )
+    upstream_headers = filtered_request_headers(request)
+    if content_length_header and content_length_header.isdigit():
+        upstream_headers["content-length"] = content_length_header
+
+    async def stream_request_body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                now = time.perf_counter()
+                if request_state["first_chunk_at"] is None:
+                    request_state["first_chunk_at"] = now
+                request_state["bytes_received"] += len(chunk)
+                request_state["truncated"] = append_capture(request_capture, chunk) or request_state["truncated"]
+                yield chunk
+        finally:
+            request_state["finished_at"] = time.perf_counter()
+            request_body_finished.set()
+
+    if has_request_body:
+        upstream_content: bytes | AsyncIterator[bytes] = stream_request_body()
+    else:
+        upstream_content = b""
+        request_state["finished_at"] = time.perf_counter()
+        request_body_finished.set()
+
+    client = get_http_client()
     upstream_request = client.build_request(
         request.method,
         target_url,
-        headers=filtered_request_headers(request),
-        content=raw_request_body,
+        headers=upstream_headers,
+        content=upstream_content,
     )
 
     upstream_started_at = time.perf_counter()
+    perf_context["pre_upstream_ms"] = elapsed_ms(started_at, upstream_started_at)
     try:
         upstream_response = await client.send(upstream_request, stream=True)
     except Exception as exc:
-        await client.aclose()
+        if not request_body_finished.is_set():
+            request_state["finished_at"] = time.perf_counter()
+            request_body_finished.set()
         finished_at = time.perf_counter()
         body = f"Upstream request failed: {exc}".encode("utf-8")
         asyncio.create_task(
             finish_log_async(
                 log_id_task,
+                request_body_task,
                 502,
                 {"content-type": "text/plain; charset=utf-8"},
                 body,
@@ -3393,10 +3695,25 @@ async def proxy_to_target(target_url: str, request: Request, access_key: str | N
                 finished_at,
                 None,
                 str(exc),
+                perf_context=perf_context,
             )
+        )
+        perf_log(
+            "proxy_error",
+            gateway_log_id=perf_context.get("gateway_log_id"),
+            method=request.method,
+            target_url=target_url,
+            error=str(exc),
+            gateway_total_ms=elapsed_ms(started_at, finished_at),
+            upstream_total_ms=elapsed_ms(upstream_started_at, finished_at),
+            pre_upstream_ms=perf_context.get("pre_upstream_ms"),
+            request_body_bytes=request_state.get("bytes_received"),
         )
         return PlainTextResponse(body.decode("utf-8"), status_code=502)
 
+    upstream_headers_at = time.perf_counter()
+    oneapi_request_id = header_value(dict(upstream_response.headers), "x-oneapi-request-id")
+    perf_context["request_id"] = oneapi_request_id
     response_headers = filtered_response_headers(upstream_response.headers)
 
     async def stream_response() -> AsyncIterator[bytes]:
@@ -3415,10 +3732,10 @@ async def proxy_to_target(target_url: str, request: Request, access_key: str | N
         finally:
             finished_at = time.perf_counter()
             await upstream_response.aclose()
-            await client.aclose()
             asyncio.create_task(
                 finish_log_async(
                     log_id_task,
+                    request_body_task,
                     upstream_response.status_code,
                     dict(upstream_response.headers),
                     response_capture,
@@ -3428,8 +3745,42 @@ async def proxy_to_target(target_url: str, request: Request, access_key: str | N
                     finished_at,
                     first_byte_at,
                     error,
+                    perf_context=perf_context,
                 )
             )
+            gateway_total_ms = elapsed_ms(started_at, finished_at)
+            upstream_total_ms = elapsed_ms(upstream_started_at, finished_at)
+            gateway_overhead_ms = gateway_total_ms - upstream_total_ms
+            if gateway_overhead_ms >= PERFORMANCE_LOG_THRESHOLD_MS or error:
+                request_finished_at = request_state.get("finished_at")
+                request_first_chunk_at = request_state.get("first_chunk_at")
+                perf_log(
+                    "proxy",
+                    request_id=oneapi_request_id,
+                    gateway_log_id=perf_context.get("gateway_log_id"),
+                    method=request.method,
+                    target_url=target_url,
+                    status_code=upstream_response.status_code,
+                    gateway_total_ms=gateway_total_ms,
+                    upstream_total_ms=upstream_total_ms,
+                    gateway_overhead_ms=gateway_overhead_ms,
+                    pre_upstream_ms=perf_context.get("pre_upstream_ms"),
+                    request_first_chunk_ms=(
+                        elapsed_ms(started_at, request_first_chunk_at) if request_first_chunk_at is not None else None
+                    ),
+                    request_upload_ms=(
+                        elapsed_ms(upstream_started_at, request_finished_at) if request_finished_at is not None else None
+                    ),
+                    upstream_headers_ms=elapsed_ms(upstream_started_at, upstream_headers_at),
+                    first_response_byte_ms=(elapsed_ms(started_at, first_byte_at) if first_byte_at is not None else None),
+                    response_stream_ms=(elapsed_ms(first_byte_at, finished_at) if first_byte_at is not None else None),
+                    request_body_bytes=request_state.get("bytes_received"),
+                    request_capture_bytes=len(request_capture),
+                    response_body_bytes=len(response_capture),
+                    request_body_truncated=bool(request_state.get("truncated")),
+                    response_body_truncated=response_truncated,
+                    error=error,
+                )
 
     return StreamingResponse(
         stream_response(),

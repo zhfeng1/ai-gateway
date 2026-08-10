@@ -17,7 +17,7 @@ AI Gateway 是一个用于调试 AI 接口的 Python HTTP 网关。它可以把�
 
 ```bash
 cd /opt/docker/ai-gateway
-docker compose up -d --build
+APP_COMMIT="$(git rev-parse --short HEAD)" docker compose up -d --build
 ```
 
 默认控制台地址：

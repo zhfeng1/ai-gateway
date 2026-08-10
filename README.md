@@ -12,13 +12,15 @@ AI Gateway 是一个用于调试 AI 接口的 Python HTTP 网关。它可以把�
 - 性能指标：展示本项目耗时、上游接口耗时、差值、首字用时、TPS、Reasoning Tokens。
 - 实时列表：通过 WebSocket 推送请求列表，已完成请求不会反复刷新右侧详情。
 - new-api 联动：根据 `x-oneapi-request-id` 查询 `new-api-log`，展示请求人和完整消费日志，并支持 Request ID 反查。
+- 流式请求转发：Request Body 边接收、边转发、边记录，避免大请求体完整缓存后才请求上游。
+- 性能诊断：慢请求会输出带 Request ID 的分阶段性能日志，上游连接使用共享连接池。
 - 桌面包：Release 提供 macOS `.app` 和 Windows `.exe`，双击即可打开内嵌控制台窗口。
 
 ## Docker Compose 部署
 
 ```bash
 cd /opt/docker/ai-gateway
-docker compose up -d --build
+APP_COMMIT="$(git rev-parse --short HEAD)" docker compose up -d --build
 ```
 
 默认控制台地址：
@@ -145,11 +147,17 @@ data\ai_gateway.sqlite3
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_TYPE` | `sqlite` | 日志存储类型：`sqlite` 或 `postgres` |
+| `APP_COMMIT` | `unknown` | 页面和 `/health` 展示的部署 Commit，构建镜像时注入 |
 | `DATABASE_PATH` | `/data/ai_gateway.sqlite3` | SQLite 数据库路径 |
 | `DATABASE_URL` | - | AI Gateway PostgreSQL 连接串，设置后自动启用 PostgreSQL |
 | `NEW_API_LOG_DATABASE_URL` | - | new-api 日志数据库 PostgreSQL 连接串 |
 | `NEW_API_LOG_TABLES` | `logs` | new-api 日志查询表，多个表用逗号分隔 |
 | `NEW_API_LOG_QUERY_TIMEOUT_SECONDS` | `3` | new-api 日志查询超时时间 |
+| `PERFORMANCE_LOG_ENABLED` | `1` | 是否输出慢请求性能分析日志 |
+| `PERFORMANCE_LOG_THRESHOLD_MS` | `100` | 差值或后台阶段超过该值时输出性能日志 |
+| `HTTP_MAX_CONNECTIONS` | `500` | 上游 HTTP 连接池最大连接数 |
+| `HTTP_MAX_KEEPALIVE_CONNECTIONS` | `200` | 上游 HTTP 连接池最大空闲连接数 |
+| `HTTP_KEEPALIVE_EXPIRY_SECONDS` | `30` | 上游空闲连接保留时间 |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | 上游请求超时时间 |
 | `MAX_CAPTURE_BYTES` | `0` | Body 最大记录字节数，`0` 表示完整记录 |
 
@@ -164,6 +172,16 @@ data\ai_gateway.sqlite3
 - 完整记录大型流式响应会增加内存和磁盘占用，可通过 `MAX_CAPTURE_BYTES` 限制记录大小。
 - Hop-by-hop headers，例如 `connection`、`transfer-encoding`、`content-length`，不会直接转发。
 - Docker Compose 默认只绑定 `127.0.0.1:20000`，如需公网访问建议配合反向代理或 Cloudflare Tunnel。
+
+## 性能日志
+
+慢请求会输出单行 JSON 日志，前缀为 `AI_GATEWAY_PERF`。拿到 `x-oneapi-request-id` 后可以这样检索：
+
+```bash
+docker logs ai-gateway 2>&1 | grep 'AI_GATEWAY_PERF' | grep '202607300540391603842458268d9d6pZ0mn1Ik'
+```
+
+`proxy` 事件包含请求上传、上游响应头、首字、响应流以及网关差值等时间；`background` 事件包含数据库写入、WebSocket 广播和 new-api-log 查询时间。
 
 ## 致谢与社区
 
