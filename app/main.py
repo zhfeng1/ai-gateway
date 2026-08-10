@@ -3285,7 +3285,14 @@ async def dashboard() -> str:
     function renderResponsesInputItem(item, index) {
       const category = responsesInputCategory(item);
       const isMessage = category === 'message' && item && typeof item === 'object' && !Array.isArray(item);
-      const excluded = new Set(['type', 'role', 'status', 'call_id', 'id']);
+      const excluded = new Set([
+        'type',
+        'role',
+        'status',
+        'call_id',
+        'id',
+        'internal_chat_message_metadata_passthrough',
+      ]);
       if (isMessage) excluded.add('content');
       const rawJson = JSON.stringify(item, null, 2) ?? String(item);
       return `
