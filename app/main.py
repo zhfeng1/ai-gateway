@@ -296,11 +296,15 @@ def ensure_sqlite_db() -> None:
                     upstream_duration_ms INTEGER,
                     first_byte_ms INTEGER,
                     output_tokens INTEGER,
-                    access_key TEXT
+                    access_key TEXT,
+                    response_failed INTEGER NOT NULL DEFAULT 0,
+                    response_failure_code TEXT,
+                    response_failure_message TEXT
                 )
                 """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
+        backfill_response_failed = "response_failed" not in columns
         for column_name, column_type in (
             ("upstream_duration_ms", "INTEGER"),
             ("first_byte_ms", "INTEGER"),
@@ -312,9 +316,20 @@ def ensure_sqlite_db() -> None:
             ("new_api_user", "TEXT"),
             ("new_api_log", "TEXT"),
             ("new_api_log_error", "TEXT"),
+            ("response_failed", "INTEGER NOT NULL DEFAULT 0"),
+            ("response_failure_code", "TEXT"),
+            ("response_failure_message", "TEXT"),
         ):
             if column_name not in columns:
                 conn.execute(f"ALTER TABLE request_logs ADD COLUMN {column_name} {column_type}")
+        if backfill_response_failed:
+            conn.execute(
+                """
+                UPDATE request_logs
+                SET response_failed = 1
+                WHERE instr(CAST(response_body AS TEXT), 'event: response.failed') > 0
+                """
+            )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
 
@@ -348,7 +363,10 @@ def ensure_postgres_db() -> None:
                     oneapi_request_id TEXT,
                     new_api_user TEXT,
                     new_api_log TEXT,
-                    new_api_log_error TEXT
+                    new_api_log_error TEXT,
+                    response_failed INTEGER NOT NULL DEFAULT 0,
+                    response_failure_code TEXT,
+                    response_failure_message TEXT
                 )
                 """
             )
@@ -360,6 +378,7 @@ def ensure_postgres_db() -> None:
                 """
             )
             columns = {row[0] for row in cur.fetchall()}
+            backfill_response_failed = "response_failed" not in columns
             for column_name, column_type in (
                 ("upstream_duration_ms", "INTEGER"),
                 ("first_byte_ms", "INTEGER"),
@@ -371,9 +390,20 @@ def ensure_postgres_db() -> None:
                 ("new_api_user", "TEXT"),
                 ("new_api_log", "TEXT"),
                 ("new_api_log_error", "TEXT"),
+                ("response_failed", "INTEGER NOT NULL DEFAULT 0"),
+                ("response_failure_code", "TEXT"),
+                ("response_failure_message", "TEXT"),
             ):
                 if column_name not in columns:
                     cur.execute(f"ALTER TABLE request_logs ADD COLUMN {column_name} {column_type}")
+            if backfill_response_failed:
+                cur.execute(
+                    """
+                    UPDATE request_logs
+                    SET response_failed = 1
+                    WHERE position(convert_to('event: response.failed', 'UTF8') in response_body) > 0
+                    """
+                )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_access_key_id ON request_logs(access_key, id DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_oneapi_request_id ON request_logs(oneapi_request_id)")
         conn.commit()
@@ -716,6 +746,7 @@ def finish_log(
     output_tokens = output_tokens_from_body(response_bytes)
     reasoning_tokens = reasoning_tokens_from_body(response_bytes)
     response_api_type = api_type_from_body(response_bytes)
+    response_failure = response_failed_from_sse(response_bytes)
     oneapi_request_id = header_value(response_headers, "x-oneapi-request-id")
     db_execute(
         """
@@ -731,7 +762,10 @@ def finish_log(
             output_tokens = ?,
             reasoning_tokens = ?,
             api_type = COALESCE(?, api_type),
-            oneapi_request_id = ?
+            oneapi_request_id = ?,
+            response_failed = ?,
+            response_failure_code = ?,
+            response_failure_message = ?
         WHERE id = ?
         """,
         (
@@ -747,6 +781,11 @@ def finish_log(
             reasoning_tokens,
             response_api_type,
             oneapi_request_id,
+            int(response_failure is not None),
+            str(response_failure.get("code") or response_failure.get("type") or "response_failed")
+            if response_failure
+            else None,
+            str(response_failure.get("message") or json_dumps(response_failure)) if response_failure else None,
             log_id,
         ),
     )
@@ -1119,6 +1158,9 @@ def row_to_summary(row: dict[str, Any]) -> dict:
             else None
         ),
         "error": row["error"],
+        "response_failed": bool(row.get("response_failed")),
+        "response_failure_code": row.get("response_failure_code"),
+        "response_failure_message": row.get("response_failure_message"),
         "request_body_bytes": row["request_body_bytes"] or 0,
         "response_body_bytes": row["response_body_bytes"] or 0,
         "reasoning_tokens": row["reasoning_tokens"],
@@ -1147,6 +1189,7 @@ def list_log_summaries(limit: int = 100, access_key: str | None = None) -> list[
         SELECT id, created_at, method, target_url, client_host, response_status,
                access_key, duration_ms, upstream_duration_ms, first_byte_ms,
                output_tokens, reasoning_tokens, api_type, error,
+               response_failed, response_failure_code, response_failure_message,
                oneapi_request_id, new_api_user, new_api_log_error,
                {byte_length}(request_body) AS request_body_bytes,
                {byte_length}(response_body) AS response_body_bytes,
@@ -1618,6 +1661,20 @@ async def dashboard() -> str:
       border-color: rgba(39, 209, 127, .42);
       box-shadow: inset 3px 0 0 var(--accent), 0 12px 28px rgba(0, 0, 0, .20);
     }
+    .item.response-failed {
+      border-color: rgba(255, 92, 115, .44);
+      background: linear-gradient(90deg, rgba(255, 92, 115, .14), rgba(255, 92, 115, .035) 62%);
+      box-shadow: inset 4px 0 0 var(--bad);
+    }
+    .item.response-failed:hover {
+      border-color: rgba(255, 92, 115, .66);
+      background: linear-gradient(90deg, rgba(255, 92, 115, .19), rgba(25, 34, 49, .76) 68%);
+    }
+    .item.response-failed.active {
+      border-color: rgba(255, 92, 115, .82);
+      background: linear-gradient(90deg, rgba(255, 92, 115, .24), rgba(53, 183, 255, .07) 72%);
+      box-shadow: inset 4px 0 0 var(--bad), 0 12px 28px rgba(0, 0, 0, .24);
+    }
     .meta {
       display: flex;
       gap: 8px;
@@ -1650,6 +1707,13 @@ async def dashboard() -> str:
       color: var(--bad);
       border-color: rgba(255, 92, 115, .44);
       background: rgba(255, 92, 115, .10);
+    }
+    .badge.response-failed-badge {
+      color: #fff1f3;
+      border-color: rgba(255, 92, 115, .72);
+      background: rgba(190, 24, 55, .72);
+      letter-spacing: .035em;
+      box-shadow: 0 0 0 1px rgba(255, 92, 115, .08), 0 5px 16px rgba(190, 24, 55, .22);
     }
     .badge.api-type {
       color: var(--accent-2);
@@ -1700,6 +1764,42 @@ async def dashboard() -> str:
         linear-gradient(180deg, rgba(25, 34, 49, .92), rgba(12, 17, 26, .92)),
         var(--panel);
       box-shadow: 0 18px 44px rgba(0, 0, 0, .26), inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+    .detail-head.response-failed {
+      border-color: rgba(255, 92, 115, .62);
+      background:
+        linear-gradient(135deg, rgba(255, 92, 115, .13), rgba(25, 34, 49, .94) 42%, rgba(12, 17, 26, .94)),
+        var(--panel);
+      box-shadow: inset 4px 0 0 var(--bad), 0 18px 44px rgba(0, 0, 0, .28);
+    }
+    .response-failure-banner {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px 14px;
+      align-items: start;
+      padding: 12px 14px;
+      border: 1px solid rgba(255, 92, 115, .52);
+      border-radius: 11px;
+      background: rgba(130, 15, 38, .28);
+      color: #ffe4e8;
+    }
+    .response-failure-title {
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: .035em;
+      white-space: nowrap;
+    }
+    .response-failure-content {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+      font-size: 13px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .response-failure-code {
+      color: #ffb6c1;
+      font: 700 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     .detail-topline {
       display: grid;
@@ -2490,7 +2590,7 @@ async def dashboard() -> str:
     }
 
     function statusClassForRow(row) {
-      return row.error ? 'err' : statusClass(row.response_status);
+      return row.error || row.response_failed ? 'err' : statusClass(row.response_status);
     }
 
     function statusLabel(row) {
@@ -2988,7 +3088,7 @@ async def dashboard() -> str:
       return rowsCache.filter(row => {
         if (activeApiTypeFilter && row.api_type !== activeApiTypeFilter) return false;
         if (!q) return true;
-        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)} ${row.oneapi_request_id ?? ''} ${row.new_api_user ?? ''}`.toLowerCase().includes(q);
+        return `${row.method} ${row.target_url} ${statusLabel(row)} ${row.error ?? ''} ${apiTypeLabel(row.api_type)} ${row.oneapi_request_id ?? ''} ${row.new_api_user ?? ''} ${row.response_failure_code ?? ''} ${row.response_failure_message ?? ''} ${row.response_failed ? 'response failed 失败' : ''}`.toLowerCase().includes(q);
       });
     }
 
@@ -3002,8 +3102,8 @@ async def dashboard() -> str:
 
     function renderList() {
       const rows = filteredRows();
-      const success = rows.filter(row => row.response_status >= 200 && row.response_status < 400).length;
-      const errors = rows.filter(row => row.error || row.response_status >= 400).length;
+      const success = rows.filter(row => !row.response_failed && row.response_status >= 200 && row.response_status < 400).length;
+      const errors = rows.filter(row => row.error || row.response_failed || row.response_status >= 400).length;
       totalCountEl.textContent = numberFormatter.format(rows.length);
       successCountEl.textContent = numberFormatter.format(success);
       errorCountEl.textContent = numberFormatter.format(errors);
@@ -3016,11 +3116,12 @@ async def dashboard() -> str:
       }
 
       listEl.innerHTML = rows.map(row => `
-        <button class="item ${row.id === activeId ? 'active' : ''}" type="button" data-id="${row.id}" aria-current="${row.id === activeId ? 'true' : 'false'}">
+        <button class="item ${row.response_failed ? 'response-failed' : ''} ${row.id === activeId ? 'active' : ''}" type="button" data-id="${row.id}" aria-current="${row.id === activeId ? 'true' : 'false'}">
           <div class="meta">
             <span class="method" translate="no">${esc(row.method)}</span>
             <span class="badge status ${statusClassForRow(row)}">${esc(statusLabel(row))}</span>
             <span class="badge api-type">${esc(apiTypeLabel(row.api_type))}</span>
+            ${row.response_failed ? '<span class="badge response-failed-badge">RESPONSE FAILED</span>' : ''}
             ${row.reasoning_tokens === 516 ? '<span class="badge anomaly" title="reasoning_tokens 异常">516</span>' : ''}
             ${row.new_api_user ? `<span class="badge requester" title="${esc(row.new_api_user)}">${esc(row.new_api_user)}</span>` : ''}
             <span class="grow"></span>
@@ -3614,13 +3715,14 @@ async def dashboard() -> str:
       activeResponseBodyView = responseViews.includes(activeResponseBodyView) ? activeResponseBodyView : 'json';
       renderList();
       detailEl.innerHTML = `
-        <div class="detail-head">
+        <div class="detail-head ${row.response_failed ? 'response-failed' : ''}">
           <div class="detail-topline">
             <div class="endpoint-block">
               <div class="endpoint-badges">
                 <span class="pill method-pill" translate="no">${esc(row.method)}</span>
                 <span class="pill type-pill">${esc(apiTypeLabel(apiType))}</span>
                 <span class="pill status-pill ${statusClassForRow(row)}">${esc(statusLabel(row))}</span>
+                ${row.response_failed ? '<span class="pill status-pill err">Responses SSE 失败</span>' : ''}
                 ${isReasoningAnomaly ? '<span class="pill status-pill err">reasoning 516</span>' : ''}
               </div>
               <div class="endpoint-url" translate="no">${esc(row.target_url)}</div>
@@ -3636,6 +3738,15 @@ async def dashboard() -> str:
               <button type="button" data-copy="url">复制 URL</button>
             </div>
           </div>
+          ${row.response_failed ? `
+            <div class="response-failure-banner" role="alert">
+              <div class="response-failure-title">RESPONSE FAILED</div>
+              <div class="response-failure-content">
+                <div class="response-failure-code">${esc(row.response_failure_code || 'response_failed')}</div>
+                <div>${esc(row.response_failure_message || 'OpenAI Responses SSE 返回失败事件')}</div>
+              </div>
+            </div>
+          ` : ''}
           <div class="metric-grid" aria-label="请求关键指标">
             <div class="metric-card primary"><div class="metric-label">本项目耗时</div><div class="metric-value">${esc(formatMs(row.duration_ms))}</div></div>
             <div class="metric-card"><div class="metric-label">上游接口耗时</div><div class="metric-value">${esc(formatMs(row.upstream_duration_ms))}</div></div>
@@ -3875,6 +3986,7 @@ def log_row_payload(row: dict[str, Any]) -> dict[str, Any]:
     if reasoning_tokens is None:
         reasoning_tokens = reasoning_tokens_from_body(response_body)
     api_type = row.get("api_type") or api_type_from_log(row.get("target_url") or "", request_body, response_body)
+    response_failure = response_failed_from_sse(response_body)
     new_api_log = json_object_from_text(row.get("new_api_log"), None)
     if new_api_log is None and row.get("new_api_log"):
         new_api_log = {"raw": str(row["new_api_log"]), "clipped": True}
@@ -3897,6 +4009,11 @@ def log_row_payload(row: dict[str, Any]) -> dict[str, Any]:
         "reasoning_tokens": reasoning_tokens,
         "api_type": api_type,
         "error": row.get("error"),
+        "response_failed": bool(row.get("response_failed")) or response_failure is not None,
+        "response_failure_code": row.get("response_failure_code")
+        or (response_failure.get("code") if response_failure else None),
+        "response_failure_message": row.get("response_failure_message")
+        or (response_failure.get("message") if response_failure else None),
         "duration_ms": duration_ms,
         "upstream_duration_ms": upstream_duration_ms,
         "first_byte_ms": row.get("first_byte_ms"),
