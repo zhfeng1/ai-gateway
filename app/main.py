@@ -34,6 +34,8 @@ PERFORMANCE_LOG_THRESHOLD_MS = int(float(os.getenv("PERFORMANCE_LOG_THRESHOLD_MS
 HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "500"))
 HTTP_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "200"))
 HTTP_KEEPALIVE_EXPIRY_SECONDS = float(os.getenv("HTTP_KEEPALIVE_EXPIRY_SECONDS", "30"))
+DINGTALK_WEBHOOK_URL = os.getenv("DINGTALK_WEBHOOK_URL", "").strip()
+DINGTALK_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("DINGTALK_WEBHOOK_TIMEOUT_SECONDS", "10"))
 POSTGRES_CONNECT_TIMEOUT_SECONDS = int(float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
 NEW_API_LOG_DATABASE_URL = (
     os.getenv("NEW_API_LOG_DATABASE_URL")
@@ -824,6 +826,50 @@ def parse_completed_response_from_sse(body: bytes) -> object | None:
     return None
 
 
+def response_failed_from_sse(body: bytes | bytearray) -> dict[str, Any] | None:
+    try:
+        text = bytes(body).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    for event in reversed(parse_sse_events(text)):
+        try:
+            payload = json.loads(event["data"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if event["event"] != "response.failed" and payload.get("type") != "response.failed":
+            continue
+        response = payload.get("response")
+        error = response.get("error") if isinstance(response, dict) else payload.get("error")
+        if isinstance(error, dict):
+            return error
+        return {"code": "response_failed", "message": str(error or "OpenAI Responses 请求失败")}
+    return None
+
+
+async def send_dingtalk_response_failed_alert(error: dict[str, Any]) -> None:
+    if not DINGTALK_WEBHOOK_URL:
+        return
+    reason = error.get("code") or error.get("type") or "response_failed"
+    message = error.get("message") or json_dumps(error)
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": f"AI Gateway response.failed 通知\n失败原因：{reason}\n失败信息：{message}",
+        },
+    }
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(DINGTALK_WEBHOOK_TIMEOUT_SECONDS),
+        trust_env=False,
+    ) as client:
+        response = await client.post(DINGTALK_WEBHOOK_URL, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if isinstance(result, dict) and result.get("errcode") not in (None, 0):
+            raise RuntimeError(f"DingTalk webhook failed: {result.get('errmsg') or result.get('errcode')}")
+
+
 def find_reasoning_tokens(payload: object) -> int | None:
     if isinstance(payload, dict):
         for path in (
@@ -1186,6 +1232,15 @@ async def finish_log_async(
         db_finish_started_at = time.perf_counter()
         request_id = await asyncio.to_thread(finish_log, log_id, *args)
         perf_context["db_finish_ms"] = elapsed_ms(db_finish_started_at)
+        failed_response = response_failed_from_sse(args[2]) if len(args) > 2 else None
+        if failed_response:
+            dingtalk_started_at = time.perf_counter()
+            try:
+                await send_dingtalk_response_failed_alert(failed_response)
+                perf_context["dingtalk_notify_ms"] = elapsed_ms(dingtalk_started_at)
+            except Exception as exc:
+                perf_context["dingtalk_notify_error"] = str(exc)
+                print(f"Failed to send DingTalk response.failed alert for log {log_id}: {exc}", flush=True)
         access_key = await asyncio.to_thread(log_access_key, log_id)
         broadcast_started_at = time.perf_counter()
         await broadcast_logs(log_id, access_key)
@@ -1211,6 +1266,8 @@ async def finish_log_async(
                 db_finish_ms=perf_context.get("db_finish_ms"),
                 broadcast_ms=perf_context.get("broadcast_ms"),
                 new_api_enrich_ms=perf_context.get("new_api_enrich_ms"),
+                dingtalk_notify_ms=perf_context.get("dingtalk_notify_ms"),
+                dingtalk_notify_error=perf_context.get("dingtalk_notify_error"),
                 background_total_ms=perf_context.get("background_total_ms"),
             )
     except Exception as exc:

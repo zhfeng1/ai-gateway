@@ -159,6 +159,8 @@ data\ai_gateway.sqlite3
 | `HTTP_MAX_CONNECTIONS` | `500` | 上游 HTTP 连接池最大连接数 |
 | `HTTP_MAX_KEEPALIVE_CONNECTIONS` | `200` | 上游 HTTP 连接池最大空闲连接数 |
 | `HTTP_KEEPALIVE_EXPIRY_SECONDS` | `30` | 上游空闲连接保留时间 |
+| `DINGTALK_WEBHOOK_URL` | - | Responses SSE 出现 `response.failed` 时使用的钉钉机器人 Webhook |
+| `DINGTALK_WEBHOOK_TIMEOUT_SECONDS` | `10` | 钉钉通知请求超时时间 |
 | `REQUEST_TIMEOUT_SECONDS` | `600` | 上游请求超时时间 |
 | `MAX_CAPTURE_BYTES` | `0` | Body 最大记录字节数，`0` 表示完整记录 |
 
