@@ -4,6 +4,7 @@ ARG APP_COMMIT=unknown
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     APP_COMMIT=${APP_COMMIT}
 
 WORKDIR /app
