@@ -943,7 +943,7 @@ def response_failed_from_sse(body: bytes | bytearray) -> dict[str, Any] | None:
     return None
 
 
-async def send_dingtalk_response_failed_alert(error: dict[str, Any]) -> None:
+async def send_dingtalk_response_failed_alert(error: dict[str, Any], request_id: str | None = None) -> None:
     if not DINGTALK_WEBHOOK_URL:
         return
     reason = error.get("code") or error.get("type") or "response_failed"
@@ -951,7 +951,12 @@ async def send_dingtalk_response_failed_alert(error: dict[str, Any]) -> None:
     payload = {
         "msgtype": "text",
         "text": {
-            "content": f"AI Gateway response.failed 通知\n失败原因：{reason}\n失败信息：{message}",
+            "content": (
+                "AI Gateway response.failed 通知\n"
+                f"Request ID：{request_id or '-'}\n"
+                f"失败原因：{reason}\n"
+                f"失败信息：{message}"
+            ),
         },
     }
     async with httpx.AsyncClient(
@@ -1335,7 +1340,7 @@ async def finish_log_async(
         if failed_response:
             dingtalk_started_at = time.perf_counter()
             try:
-                await send_dingtalk_response_failed_alert(failed_response)
+                await send_dingtalk_response_failed_alert(failed_response, request_id)
                 perf_context["dingtalk_notify_ms"] = elapsed_ms(dingtalk_started_at)
             except Exception as exc:
                 perf_context["dingtalk_notify_error"] = str(exc)
