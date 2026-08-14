@@ -848,7 +848,7 @@ def finish_log(
     return oneapi_request_id
 
 
-def enrich_new_api_log(log_id: int, request_id: str) -> None:
+def enrich_new_api_log(log_id: int, request_id: str) -> str | None:
     new_api_user, new_api_log, new_api_log_error = new_api_log_cache_fields(request_id)
     db_execute(
         """
@@ -858,6 +858,7 @@ def enrich_new_api_log(log_id: int, request_id: str) -> None:
         """,
         (new_api_user, new_api_log, new_api_log_error, log_id),
     )
+    return new_api_user
 
 
 def capture_bytes(data: bytes) -> tuple[bytes, bool]:
@@ -943,17 +944,23 @@ def response_failed_from_sse(body: bytes | bytearray) -> dict[str, Any] | None:
     return None
 
 
-async def send_dingtalk_response_failed_alert(error: dict[str, Any], request_id: str | None = None) -> None:
+async def send_dingtalk_response_failed_alert(
+    error: dict[str, Any],
+    request_id: str | None = None,
+    requester: str | None = None,
+) -> None:
     if not DINGTALK_WEBHOOK_URL:
         return
     reason = error.get("code") or error.get("type") or "response_failed"
     message = error.get("message") or json_dumps(error)
+    requester_line = f"请求人：{requester}\n" if requester else ""
     payload = {
         "msgtype": "text",
         "text": {
             "content": (
                 "AI Gateway response.failed 通知\n"
                 f"Request ID：{request_id or '-'}\n"
+                f"{requester_line}"
                 f"失败原因：{reason}\n"
                 f"失败信息：{message}"
             ),
@@ -1337,10 +1344,17 @@ async def finish_log_async(
         request_id = await asyncio.to_thread(finish_log, log_id, *args)
         perf_context["db_finish_ms"] = elapsed_ms(db_finish_started_at)
         failed_response = response_failed_from_sse(args[2]) if len(args) > 2 else None
+        new_api_user = None
+        new_api_enriched = False
+        if failed_response and request_id and NEW_API_LOG_DATABASE_URL:
+            enrich_started_at = time.perf_counter()
+            new_api_user = await asyncio.to_thread(enrich_new_api_log, log_id, request_id)
+            new_api_enriched = True
+            perf_context["new_api_enrich_ms"] = elapsed_ms(enrich_started_at)
         if failed_response:
             dingtalk_started_at = time.perf_counter()
             try:
-                await send_dingtalk_response_failed_alert(failed_response, request_id)
+                await send_dingtalk_response_failed_alert(failed_response, request_id, new_api_user)
                 perf_context["dingtalk_notify_ms"] = elapsed_ms(dingtalk_started_at)
             except Exception as exc:
                 perf_context["dingtalk_notify_error"] = str(exc)
@@ -1349,7 +1363,7 @@ async def finish_log_async(
         broadcast_started_at = time.perf_counter()
         await broadcast_logs(log_id, access_key)
         perf_context["broadcast_ms"] = elapsed_ms(broadcast_started_at)
-        if request_id and NEW_API_LOG_DATABASE_URL:
+        if request_id and NEW_API_LOG_DATABASE_URL and not new_api_enriched:
             enrich_started_at = time.perf_counter()
             await asyncio.to_thread(enrich_new_api_log, log_id, request_id)
             perf_context["new_api_enrich_ms"] = elapsed_ms(enrich_started_at)
