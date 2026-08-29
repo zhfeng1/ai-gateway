@@ -2450,6 +2450,40 @@ async def dashboard() -> str:
       border: 0;
       border-radius: 0;
     }
+    .input-image-summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 9px 10px;
+      border: 1px solid rgba(53, 183, 255, .28);
+      border-radius: 9px;
+      background: linear-gradient(135deg, rgba(53, 183, 255, .09), rgba(39, 209, 127, .045));
+    }
+    .input-image-summary-icon {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      flex: 0 0 auto;
+      border: 1px solid rgba(53, 183, 255, .3);
+      border-radius: 9px;
+      color: #8ddcff;
+      background: rgba(53, 183, 255, .08);
+    }
+    .input-image-summary-icon svg { width: 18px; height: 18px; }
+    .input-image-summary-body { min-width: 0; display: grid; gap: 5px; }
+    .input-image-summary-title { color: var(--text); font-size: 12px; font-weight: 750; }
+    .input-image-summary-meta {
+      display: flex;
+      align-items: center;
+      gap: 5px 10px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .input-image-summary-meta span { overflow-wrap: anywhere; }
     details.input-raw {
       border-top: 1px solid var(--line);
       background: rgba(5, 7, 11, .24);
@@ -2652,6 +2686,7 @@ async def dashboard() -> str:
     const JSON_NODE_LIMIT = 1_500;
     const JSON_AUTO_OPEN_DEPTH = 1;
     const TEXT_RENDER_LIMIT = 320_000;
+    const RESPONSES_IMAGE_SUMMARY_MARKER = Symbol('responsesImageSummary');
 
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({
@@ -3444,8 +3479,113 @@ async def dashboard() -> str:
       return values.map(([label, value]) => `<span class="pill" title="${esc(value)}">${esc(label)}: ${esc(value)}</span>`).join('');
     }
 
+    function base64ImageDataUrlSummary(value) {
+      if (typeof value !== 'string') return null;
+      const commaIndex = value.indexOf(',');
+      if (commaIndex < 6) return null;
+      const header = value.slice(0, commaIndex);
+      const normalizedHeader = header.toLowerCase();
+      if (!normalizedHeader.startsWith('data:image/') || !normalizedHeader.includes(';base64')) return null;
+
+      let payloadEnd = value.length;
+      while (payloadEnd > commaIndex + 1 && /\\s/.test(value[payloadEnd - 1])) payloadEnd -= 1;
+      const encodedChars = Math.max(0, payloadEnd - commaIndex - 1);
+      let padding = 0;
+      if (payloadEnd > commaIndex + 1 && value[payloadEnd - 1] === '=') padding += 1;
+      if (payloadEnd > commaIndex + 2 && value[payloadEnd - 2] === '=') padding += 1;
+      const mediaTypeEnd = header.indexOf(';');
+      const mediaType = header.slice(5, mediaTypeEnd > 5 ? mediaTypeEnd : undefined).toLowerCase();
+      return {
+        [RESPONSES_IMAGE_SUMMARY_MARKER]: true,
+        mediaType,
+        bytes: Math.max(0, Math.floor(encodedChars * 3 / 4) - padding),
+        encodedChars,
+        metadata: {},
+      };
+    }
+
+    function isResponsesImageSummary(value) {
+      return Boolean(value && typeof value === 'object' && value[RESPONSES_IMAGE_SUMMARY_MARKER]);
+    }
+
+    function summarizeResponsesInputImages(value, key = '', stats = null) {
+      if (key === 'image_url') {
+        const directSummary = base64ImageDataUrlSummary(value);
+        if (directSummary) {
+          if (stats) {
+            stats.count += 1;
+            stats.bytes += directSummary.bytes;
+          }
+          return directSummary;
+        }
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const urlSummary = base64ImageDataUrlSummary(value.url);
+          if (urlSummary) {
+            urlSummary.metadata = Object.fromEntries(
+              Object.entries(value)
+                .filter(([field]) => field !== 'url')
+                .map(([field, fieldValue]) => [field, summarizeResponsesInputImages(fieldValue, field, stats)])
+            );
+            if (stats) {
+              stats.count += 1;
+              stats.bytes += urlSummary.bytes;
+            }
+            return urlSummary;
+          }
+        }
+      }
+      if (Array.isArray(value)) {
+        return value.map(item => summarizeResponsesInputImages(item, '', stats));
+      }
+      if (value && typeof value === 'object') {
+        return Object.fromEntries(
+          Object.entries(value).map(([field, fieldValue]) => [
+            field,
+            summarizeResponsesInputImages(fieldValue, field, stats),
+          ])
+        );
+      }
+      return value;
+    }
+
+    function responsesImageSummaryJson(value) {
+      return {
+        hidden: 'Base64 图片已隐藏',
+        media_type: value.mediaType,
+        estimated_bytes: value.bytes,
+        encoded_characters: value.encodedChars,
+        ...(Object.keys(value.metadata || {}).length ? { metadata: value.metadata } : {}),
+      };
+    }
+
+    function renderResponsesImageSummary(value) {
+      const simpleMetadata = Object.entries(value.metadata || {})
+        .filter(([, item]) => item === null || ['string', 'number', 'boolean'].includes(typeof item));
+      return `
+        <div class="input-image-summary" role="note" aria-label="Base64 图片已隐藏">
+          <div class="input-image-summary-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+              <circle cx="8.5" cy="9" r="1.5"></circle>
+              <path d="m4 17 4.5-4.5 3 3 2-2L20 19"></path>
+            </svg>
+          </div>
+          <div class="input-image-summary-body">
+            <div class="input-image-summary-title">Base64 图片已隐藏</div>
+            <div class="input-image-summary-meta">
+              <span>${esc(value.mediaType || 'image/*')}</span>
+              <span>约 ${esc(formatBytes(value.bytes))}</span>
+              <span>${esc(numberFormatter.format(value.encodedChars))} 个编码字符</span>
+              ${simpleMetadata.map(([field, item]) => `<span>${esc(field)}: ${esc(item)}</span>`).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     function renderResponsesInputValue(value, key = '') {
       if (value === null || value === undefined) return '<span class="secondary">null</span>';
+      if (isResponsesImageSummary(value)) return renderResponsesImageSummary(value);
       if (typeof value === 'string') {
         const trimmed = value.trim();
         if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && value.length <= JSON_PARSE_MAX_CHARS) {
@@ -3527,7 +3667,11 @@ async def dashboard() -> str:
         'internal_chat_message_metadata_passthrough',
       ]);
       if (isMessage) excluded.add('content');
-      const rawJson = JSON.stringify(item, null, 2) ?? String(item);
+      const rawJson = JSON.stringify(
+        item,
+        (key, value) => isResponsesImageSummary(value) ? responsesImageSummaryJson(value) : value,
+        2,
+      ) ?? String(item);
       return `
         <article class="input-item ${esc(category)}">
           <div class="input-item-index" aria-label="第 ${numberFormatter.format(index + 1)} 项">${numberFormatter.format(index + 1)}</div>
@@ -3561,8 +3705,10 @@ async def dashboard() -> str:
         dialogContent.innerHTML = '<div class="empty">Request Body 中没有找到 input 字段。</div>';
         return;
       }
-      const inputIsArray = Array.isArray(payload.input);
-      const items = inputIsArray ? payload.input : [payload.input];
+      const imageStats = { count: 0, bytes: 0 };
+      const summarizedInput = summarizeResponsesInputImages(payload.input, 'input', imageStats);
+      const inputIsArray = Array.isArray(summarizedInput);
+      const items = inputIsArray ? summarizedInput : [summarizedInput];
       const counts = items.reduce((result, item) => {
         const category = responsesInputCategory(item);
         result[category] = (result[category] || 0) + 1;
@@ -3574,6 +3720,9 @@ async def dashboard() -> str:
         ['工具结果', counts.output],
         ['其他', counts.other],
       ].filter(([, count]) => count).map(([label, count]) => `<span class="pill">${label} ${numberFormatter.format(count)}</span>`).join('');
+      const imageSummary = imageStats.count
+        ? `<span class="pill">Base64 图片 ${numberFormatter.format(imageStats.count)} · 约 ${esc(formatBytes(imageStats.bytes))}</span>`
+        : '';
       dialogContent.innerHTML = `
         <div class="input-dialog-intro">
           <div>
@@ -3581,7 +3730,7 @@ async def dashboard() -> str:
             <p>保持 input ${inputIsArray ? '数组' : '字段'}的原始顺序；每项末尾可展开完整 JSON，未知类型也会原样保留。${requestBodyTruncated ? '当前请求 Body 已被截断，末尾内容可能不完整。' : ''}</p>
           </div>
           <div class="input-summary" aria-label="Input 类型统计">
-            ${summary || '<span class="pill">空数组</span>'}
+            ${summary}${imageSummary}${summary || imageSummary ? '' : '<span class="pill">空数组</span>'}
           </div>
         </div>
         ${items.length ? `<div class="input-timeline">${items.map(renderResponsesInputItem).join('')}</div>` : '<div class="empty">input 数组为空</div>'}
