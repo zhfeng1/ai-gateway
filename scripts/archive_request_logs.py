@@ -35,6 +35,8 @@ def database_url() -> str:
     value = (os.getenv("DATABASE_URL") or "").strip()
     if not value:
         raise RuntimeError("DATABASE_URL is required")
+    if value.startswith("jdbc:postgresql://"):
+        value = "postgresql://" + value[len("jdbc:postgresql://") :]
     return value
 
 
