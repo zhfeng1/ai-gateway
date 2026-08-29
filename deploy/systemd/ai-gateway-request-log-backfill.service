@@ -1,0 +1,17 @@
+[Unit]
+Description=Backfill existing AI Gateway request log archives before enabling timer
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/TRS/APP/ai-gateway
+ExecStartPre=/usr/bin/docker inspect ai-gateway
+ExecStart=/usr/bin/docker exec ai-gateway python /app/scripts/archive_request_logs.py --archive-dir /data/request-log-archives --before-today --vacuum-after
+ExecStartPost=/usr/bin/systemctl enable ai-gateway-request-log-archive.timer
+ExecStartPost=/usr/bin/systemctl start ai-gateway-request-log-archive.timer
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
