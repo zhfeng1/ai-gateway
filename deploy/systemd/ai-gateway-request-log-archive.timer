@@ -2,7 +2,8 @@
 Description=Run AI Gateway request log archive every day at midnight
 
 [Timer]
-OnCalendar=*-*-* 00:00:00 Asia/Singapore
+# Production hosts use CST (UTC+8), the same civil time as Asia/Singapore.
+OnCalendar=*-*-* 00:00:00
 Persistent=true
 Unit=ai-gateway-request-log-archive.service
 
