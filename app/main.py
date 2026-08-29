@@ -13,7 +13,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 try:
     import psycopg
@@ -36,6 +36,7 @@ HTTP_MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS",
 HTTP_KEEPALIVE_EXPIRY_SECONDS = float(os.getenv("HTTP_KEEPALIVE_EXPIRY_SECONDS", "30"))
 DINGTALK_WEBHOOK_URL = os.getenv("DINGTALK_WEBHOOK_URL", "").strip()
 DINGTALK_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("DINGTALK_WEBHOOK_TIMEOUT_SECONDS", "10"))
+RESPONSES_IMAGE_SUMMARY_FLAG = "__ai_gateway_base64_image_summary__"
 POSTGRES_CONNECT_TIMEOUT_SECONDS = int(float(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
 NEW_API_LOG_DATABASE_URL = (
     os.getenv("NEW_API_LOG_DATABASE_URL")
@@ -1410,6 +1411,92 @@ def body_payload(body: bytes) -> dict:
         }
 
 
+def base64_image_data_url_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    comma_index = value.find(",")
+    if comma_index < 6:
+        return None
+    header = value[:comma_index]
+    normalized_header = header.lower()
+    if not normalized_header.startswith("data:image/") or ";base64" not in normalized_header:
+        return None
+
+    payload_end = len(value)
+    while payload_end > comma_index + 1 and value[payload_end - 1].isspace():
+        payload_end -= 1
+    encoded_chars = max(0, payload_end - comma_index - 1)
+    padding = 0
+    if payload_end > comma_index + 1 and value[payload_end - 1] == "=":
+        padding += 1
+    if payload_end > comma_index + 2 and value[payload_end - 2] == "=":
+        padding += 1
+    media_type = header[5:].split(";", 1)[0].lower() or "image/*"
+    return {
+        RESPONSES_IMAGE_SUMMARY_FLAG: True,
+        "mediaType": media_type,
+        "bytes": max(0, encoded_chars * 3 // 4 - padding),
+        "encodedChars": encoded_chars,
+        "metadata": {},
+    }
+
+
+def summarize_responses_input_images(
+    value: Any,
+    key: str = "",
+    stats: dict[str, int] | None = None,
+) -> Any:
+    if key == "image_url":
+        direct_summary = base64_image_data_url_summary(value)
+        if direct_summary is not None:
+            if stats is not None:
+                stats["count"] += 1
+                stats["bytes"] += int(direct_summary["bytes"])
+            return direct_summary
+        if isinstance(value, dict):
+            url_summary = base64_image_data_url_summary(value.get("url"))
+            if url_summary is not None:
+                url_summary["metadata"] = {
+                    field: summarize_responses_input_images(field_value, field, stats)
+                    for field, field_value in value.items()
+                    if field != "url"
+                }
+                if stats is not None:
+                    stats["count"] += 1
+                    stats["bytes"] += int(url_summary["bytes"])
+                return url_summary
+    if isinstance(value, list):
+        return [summarize_responses_input_images(item, "", stats) for item in value]
+    if isinstance(value, dict):
+        return {
+            field: summarize_responses_input_images(field_value, field, stats)
+            for field, field_value in value.items()
+        }
+    return value
+
+
+def request_body_payload_for_detail(body: bytes, api_type: str) -> dict[str, Any]:
+    if api_type != "responses":
+        return body_payload(body)
+    try:
+        text = body.decode("utf-8")
+        parsed = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body_payload(body)
+
+    stats = {"count": 0, "bytes": 0}
+    summarized = summarize_responses_input_images(parsed, "", stats)
+    if not stats["count"]:
+        return {"encoding": "utf-8", "text": text}
+    return {
+        "encoding": "utf-8",
+        "text": json.dumps(summarized, ensure_ascii=False, separators=(",", ":")),
+        "summarized": True,
+        "base64_image_count": stats["count"],
+        "base64_image_bytes": stats["bytes"],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
     return """
@@ -2686,6 +2773,7 @@ async def dashboard() -> str:
     const JSON_NODE_LIMIT = 1_500;
     const JSON_AUTO_OPEN_DEPTH = 1;
     const TEXT_RENDER_LIMIT = 320_000;
+    const RESPONSES_IMAGE_SUMMARY_FLAG = '__ai_gateway_base64_image_summary__';
     const RESPONSES_IMAGE_SUMMARY_MARKER = Symbol('responsesImageSummary');
 
     function esc(value) {
@@ -2815,6 +2903,9 @@ async def dashboard() -> str:
         return '<div class="json-leaf json-preview">已省略后续节点，复制 Body 可获取完整内容</div>';
       }
       const keyHtml = key === '' ? '' : `<span class="json-key">${esc(key)}:</span>`;
+      if (isResponsesImageSummary(value)) {
+        return `<div class="json-leaf">${keyHtml}${renderResponsesImageSummary(value)}</div>`;
+      }
       if (value && typeof value === 'object') {
         const isArray = Array.isArray(value);
         const openAttr = depth <= JSON_AUTO_OPEN_DEPTH ? ' open' : '';
@@ -3505,10 +3596,21 @@ async def dashboard() -> str:
     }
 
     function isResponsesImageSummary(value) {
-      return Boolean(value && typeof value === 'object' && value[RESPONSES_IMAGE_SUMMARY_MARKER]);
+      return Boolean(
+        value
+        && typeof value === 'object'
+        && (value[RESPONSES_IMAGE_SUMMARY_MARKER] || value[RESPONSES_IMAGE_SUMMARY_FLAG])
+      );
     }
 
     function summarizeResponsesInputImages(value, key = '', stats = null) {
+      if (isResponsesImageSummary(value)) {
+        if (stats) {
+          stats.count += 1;
+          stats.bytes += Number(value.bytes || 0);
+        }
+        return value;
+      }
       if (key === 'image_url') {
         const directSummary = base64ImageDataUrlSummary(value);
         if (directSummary) {
@@ -3981,7 +4083,7 @@ async def dashboard() -> str:
           </div>
           <div class="detail-meta">
             <div class="meta-chip"><span class="meta-label">Output Tokens</span><span class="meta-value">${esc(formatNumberValue(row.output_tokens))}</span></div>
-            <div class="meta-chip"><span class="meta-label">Request Body</span><span class="meta-value">${esc(formatBytes(row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</span></div>
+            <div class="meta-chip"><span class="meta-label">Request Body</span><span class="meta-value">${esc(formatBytes(row.request_body_bytes ?? row.request_body.text.length))}${row.request_body_truncated ? ' · truncated' : ''}</span></div>
             <div class="meta-chip"><span class="meta-label">Response Body</span><span class="meta-value">${esc(formatBytes(row.response_body.text.length))}${row.response_body_truncated ? ' · truncated' : ''}</span></div>
             <div class="meta-chip"><span class="meta-label">Created</span><span class="meta-value">${esc(formatDate(row.created_at))}</span></div>
           </div>
@@ -3999,6 +4101,7 @@ async def dashboard() -> str:
             <div class="copy-row">
               <h3>Request Body${row.request_body_truncated ? ' (truncated)' : ''}</h3>
               <div class="row-actions">
+                ${row.request_body.summarized ? `<span class="pill">已隐藏 ${numberFormatter.format(row.request_body.base64_image_count || 0)} 张 Base64 图片 · 约 ${esc(formatBytes(row.request_body.base64_image_bytes || 0))}</span>` : ''}
                 ${apiType === 'responses' ? '<button class="parse-input-button" type="button" data-responses-input>解析 Input</button>' : ''}
                 <div class="view-switch" aria-label="Request Body 视图">
                   <button type="button" data-request-view-button="json">JSON</button>
@@ -4055,11 +4158,28 @@ async def dashboard() -> str:
         responseHeaders: responseHeaderText,
       };
       detailEl.querySelectorAll('[data-copy]').forEach(button => {
-        button.addEventListener('click', event => {
+        button.addEventListener('click', async event => {
           event.preventDefault();
           event.stopPropagation();
           if (button.dataset.copy === 'requestBody') {
-            copyText(activeRequestBodyView === 'text' ? requestMessageText : requestBodyText);
+            if (activeRequestBodyView === 'text' || !row.request_body.summarized) {
+              await copyText(activeRequestBodyView === 'text' ? requestMessageText : requestBodyText);
+              return;
+            }
+            const originalLabel = button.textContent;
+            button.disabled = true;
+            button.textContent = '读取中…';
+            liveTextEl.textContent = '正在按需读取完整 Request Body…';
+            try {
+              const res = await fetch(`${apiBase}/api/logs/${row.id}/request-body`);
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              await copyText(await res.text());
+            } catch (error) {
+              liveTextEl.textContent = `完整 Body 读取失败：${String(error.message || error)}`;
+            } finally {
+              button.disabled = false;
+              button.textContent = originalLabel;
+            }
             return;
           }
           if (button.dataset.copy === 'responseBody') {
@@ -4210,6 +4330,7 @@ def log_row_payload(row: dict[str, Any]) -> dict[str, Any]:
     if reasoning_tokens is None:
         reasoning_tokens = reasoning_tokens_from_body(response_body)
     api_type = row.get("api_type") or api_type_from_log(row.get("target_url") or "", request_body, response_body)
+    request_body_payload = request_body_payload_for_detail(request_body, api_type)
     response_failure = response_failed_from_sse(response_body)
     new_api_log = json_object_from_text(row.get("new_api_log"), None)
     if new_api_log is None and row.get("new_api_log"):
@@ -4224,7 +4345,8 @@ def log_row_payload(row: dict[str, Any]) -> dict[str, Any]:
         "access_key": row.get("access_key"),
         "client_host": row.get("client_host"),
         "request_headers": json_object_from_text(row.get("request_headers"), {}),
-        "request_body": body_payload(request_body),
+        "request_body": request_body_payload,
+        "request_body_bytes": len(request_body),
         "request_body_truncated": bool(row.get("request_body_truncated")),
         "response_status": row.get("response_status"),
         "response_headers": json_object_from_text(row.get("response_headers"), {}),
@@ -4260,6 +4382,23 @@ def log_detail_response(log_id: int, access_key: str | None = None) -> JSONRespo
     if row is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse(log_row_payload(row))
+
+
+def raw_request_body_response(log_id: int, access_key: str | None = None) -> Response:
+    row = log_row_by_id(log_id, access_key)
+    if row is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(content=bytes_from_db(row.get("request_body")), media_type="application/octet-stream")
+
+
+@app.get("/api/logs/{log_id}/request-body")
+async def api_log_request_body(log_id: int) -> Response:
+    return await asyncio.to_thread(raw_request_body_response, log_id, None)
+
+
+@app.get("/{access_key}/api/logs/{log_id}/request-body")
+async def scoped_api_log_request_body(access_key: str, log_id: int) -> Response:
+    return await asyncio.to_thread(raw_request_body_response, log_id, access_key)
 
 
 def gateway_logs_by_request_id(request_id: str, access_key: str | None = None) -> list[dict[str, Any]]:
