@@ -179,9 +179,10 @@ def restore_readme(day: date, columns: list[dict[str, Any]]) -> str:
 Format: PostgreSQL binary COPY.
 
 Restore into a compatible request_logs table after checking for ID conflicts:
+  ARCHIVE_DATABASE_URL="${{DATABASE_URL#jdbc:}}"
   tar -xzf request_logs_{day.isoformat()}.tar.gz
-  psql "$DATABASE_URL" -c "\\copy request_logs ({names}) FROM '{copy_name}' WITH (FORMAT binary)"
-  psql "$DATABASE_URL" -c "SELECT setval(pg_get_serial_sequence('request_logs','id'), COALESCE(MAX(id), 1), true) FROM request_logs"
+  psql "$ARCHIVE_DATABASE_URL" -c "\\copy request_logs ({names}) FROM '{copy_name}' WITH (FORMAT binary)"
+  psql "$ARCHIVE_DATABASE_URL" -c "SELECT setval(pg_get_serial_sequence('request_logs','id'), COALESCE(MAX(id), 1), true) FROM request_logs"
 
 Verify request_logs_{day.isoformat()}.manifest.json before restoring.
 """

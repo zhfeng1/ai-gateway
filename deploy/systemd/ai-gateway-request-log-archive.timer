@@ -2,10 +2,9 @@
 Description=Run AI Gateway request log archive every day at midnight
 
 [Timer]
-OnCalendar=*-*-* 00:00:00
+OnCalendar=*-*-* 00:00:00 Asia/Singapore
 Persistent=true
 Unit=ai-gateway-request-log-archive.service
 
 [Install]
 WantedBy=timers.target
-
