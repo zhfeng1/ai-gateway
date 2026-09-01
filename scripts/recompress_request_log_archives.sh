@@ -7,6 +7,7 @@ project_dir=$(cd -- "$script_dir/.." && pwd)
 archive_dir="$project_dir/data/request-log-archives"
 keep_original=0
 dry_run=0
+disable_check=0
 current_partial=""
 source_manifest=""
 destination_manifest=""
@@ -21,6 +22,7 @@ tar.gz is deleted only after the new archive passes XZ and manifest checks.
 Options:
   --archive-dir DIR  Archive directory (default: project data directory)
   --keep-original   Keep tar.gz files after successful conversion
+  --disable-check   Only decompress and recompress; skip archive verification
   --dry-run         Show files that would be converted
   -h, --help        Show this help
 EOF
@@ -59,6 +61,10 @@ while (($#)); do
             keep_original=1
             shift
             ;;
+        --disable-check)
+            disable_check=1
+            shift
+            ;;
         --dry-run)
             dry_run=1
             shift
@@ -91,6 +97,9 @@ if ((${#archives[@]} == 0)); then
 fi
 
 log "found ${#archives[@]} tar.gz archive(s) in $archive_dir"
+if ((disable_check)); then
+    log "archive verification is disabled"
+fi
 
 converted=0
 removed=0
@@ -113,14 +122,19 @@ for source_path in "${archives[@]}"; do
     available_bytes=$(df -PB1 -- "$archive_dir" | awk 'NR == 2 {print $4}')
     ((available_bytes > source_bytes)) || fail "insufficient free space for $(basename -- "$source_path")"
 
-    source_manifest=$(mktemp "$archive_dir/.source-manifest.XXXXXX")
-    destination_manifest=$(mktemp "$archive_dir/.destination-manifest.XXXXXX")
-    tar -xOzf "$source_path" "$manifest_name" >"$source_manifest"
+    if ((disable_check == 0)); then
+        source_manifest=$(mktemp "$archive_dir/.source-manifest.XXXXXX")
+        destination_manifest=$(mktemp "$archive_dir/.destination-manifest.XXXXXX")
+        tar --occurrence=1 -xOzf "$source_path" "$manifest_name" >"$source_manifest"
+    fi
 
     if [[ -e "$destination_path" ]]; then
+        if ((disable_check)); then
+            fail "destination exists while checks are disabled: $destination_path"
+        fi
         log "validating existing $(basename -- "$destination_path")"
         env -u XZ_DEFAULTS -u XZ_OPT xz -t -- "$destination_path"
-        tar -xOJf "$destination_path" "$manifest_name" >"$destination_manifest"
+        tar --occurrence=1 -xOJf "$destination_path" "$manifest_name" >"$destination_manifest"
         cmp -s -- "$source_manifest" "$destination_manifest" \
             || fail "manifest mismatch: $destination_path"
         if ((keep_original == 0)); then
@@ -145,10 +159,12 @@ for source_path in "${archives[@]}"; do
         >"$current_partial"
 
     chmod 0640 "$current_partial"
-    env -u XZ_DEFAULTS -u XZ_OPT xz -t -- "$current_partial"
-    tar -xOJf "$current_partial" "$manifest_name" >"$destination_manifest"
-    cmp -s -- "$source_manifest" "$destination_manifest" \
-        || fail "manifest mismatch after conversion: $source_path"
+    if ((disable_check == 0)); then
+        env -u XZ_DEFAULTS -u XZ_OPT xz -t -- "$current_partial"
+        tar --occurrence=1 -xOJf "$current_partial" "$manifest_name" >"$destination_manifest"
+        cmp -s -- "$source_manifest" "$destination_manifest" \
+            || fail "manifest mismatch after conversion: $source_path"
+    fi
 
     mv -- "$current_partial" "$destination_path"
     current_partial=""
