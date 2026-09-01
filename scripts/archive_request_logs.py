@@ -478,7 +478,7 @@ def main() -> int:
         else:
             if args.retention_days < 1:
                 raise RuntimeError("--retention-days must be at least 1")
-            retained_start = today - timedelta(days=args.retention_days - 1)
+            retained_start = today - timedelta(days=args.retention_days)
             first_day = min_available_day(retained_start, zone)
             days = []
             while first_day is not None and first_day < retained_start:
