@@ -1,5 +1,5 @@
 [Unit]
-Description=Archive AI Gateway request logs from seven days ago
+Description=Archive AI Gateway request logs older than 15 days
 Requires=docker.service
 After=docker.service
 
@@ -7,9 +7,8 @@ After=docker.service
 Type=oneshot
 WorkingDirectory=/TRS/APP/ai-gateway
 ExecStartPre=/usr/bin/docker inspect ai-gateway
-ExecStart=/usr/bin/docker exec ai-gateway python /app/scripts/archive_request_logs.py --archive-dir /data/request-log-archives --day-offset 7
+ExecStart=/usr/bin/docker exec ai-gateway python /app/scripts/archive_request_logs.py --archive-dir /data/request-log-archives --before-retention --retention-days 15
 TimeoutStartSec=0
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-

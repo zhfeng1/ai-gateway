@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import time
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -20,11 +21,19 @@ import psycopg
 from psycopg import sql
 
 
-ARCHIVE_VERSION = 1
+ARCHIVE_VERSION = 2
+SUPPORTED_ARCHIVE_VERSIONS = {1, ARCHIVE_VERSION}
 DEFAULT_ARCHIVE_DIR = "/data/request-log-archives"
 DEFAULT_TIMEZONE = "Asia/Singapore"
+DEFAULT_RETENTION_DAYS = 15
 TABLE_NAME = "request_logs"
 PROGRESS_BYTES = 1024 * 1024 * 1024
+XZ_COMMAND = (
+    "xz",
+    "-T2",
+    "--lzma2=preset=9e,dict=1536MiB,lc=4,lp=0,pb=0",
+    "-c",
+)
 
 
 def log(message: str) -> None:
@@ -180,7 +189,7 @@ Format: PostgreSQL binary COPY.
 
 Restore into a compatible request_logs table after checking for ID conflicts:
   ARCHIVE_DATABASE_URL="${{DATABASE_URL#jdbc:}}"
-  tar -xzf request_logs_{day.isoformat()}.tar.gz
+  tar -xJf request_logs_{day.isoformat()}.tar.xz
   psql "$ARCHIVE_DATABASE_URL" -c "\\copy request_logs ({names}) FROM '{copy_name}' WITH (FORMAT binary)"
   psql "$ARCHIVE_DATABASE_URL" -c "SELECT setval(pg_get_serial_sequence('request_logs','id'), COALESCE(MAX(id), 1), true) FROM request_logs"
 
@@ -193,7 +202,6 @@ def build_archive(
     stage_dir: Path,
     final_path: Path,
     manifest: dict[str, Any],
-    compression_level: int,
 ) -> None:
     copy_name = str(manifest["copy_file"])
     copy_path = stage_dir / copy_name
@@ -206,13 +214,44 @@ def build_archive(
 
     partial_path = final_path.with_suffix(final_path.suffix + ".partial")
     partial_path.unlink(missing_ok=True)
-    log(f"compressing {copy_path.name} into {final_path.name}")
-    with tarfile.open(partial_path, "w:gz", compresslevel=compression_level) as archive:
-        archive.add(manifest_path, arcname=manifest_name, recursive=False)
-        archive.add(readme_path, arcname=readme_name, recursive=False)
-        info = archive.gettarinfo(str(copy_path), arcname=copy_name)
-        with copy_path.open("rb") as source:
-            archive.addfile(info, ProgressReader(source, "compressed"))
+    log(f"compressing {copy_path.name} into {final_path.name}: {' '.join(XZ_COMMAND)}")
+    with partial_path.open("wb") as compressed:
+        process = subprocess.Popen(
+            XZ_COMMAND,
+            stdin=subprocess.PIPE,
+            stdout=compressed,
+            stderr=subprocess.PIPE,
+        )
+        if process.stdin is None or process.stderr is None:
+            process.kill()
+            process.wait()
+            raise RuntimeError("failed to open xz pipeline")
+        try:
+            with tarfile.open(fileobj=process.stdin, mode="w|") as archive:
+                archive.add(manifest_path, arcname=manifest_name, recursive=False)
+                archive.add(readme_path, arcname=readme_name, recursive=False)
+                info = archive.gettarinfo(str(copy_path), arcname=copy_name)
+                with copy_path.open("rb") as source:
+                    archive.addfile(info, ProgressReader(source, "compressed"))
+            process.stdin.close()
+            stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = process.wait()
+        except Exception as exc:
+            if not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = process.wait()
+            partial_path.unlink(missing_ok=True)
+            if return_code != 0:
+                raise RuntimeError(f"xz failed with exit code {return_code}: {stderr}") from exc
+            raise
+        if return_code != 0:
+            partial_path.unlink(missing_ok=True)
+            raise RuntimeError(f"xz failed with exit code {return_code}: {stderr}")
+        compressed.flush()
+        os.fsync(compressed.fileno())
     os.chmod(partial_path, 0o640)
     os.replace(partial_path, final_path)
     directory_fd = os.open(final_path.parent, os.O_DIRECTORY)
@@ -227,7 +266,13 @@ def verify_archive(path: Path, *, full: bool) -> dict[str, Any]:
     copy_sha256 = hashlib.sha256()
     copy_bytes = 0
     next_progress = PROGRESS_BYTES
-    with tarfile.open(path, "r|gz") as archive:
+    if path.name.endswith(".tar.xz"):
+        archive_mode = "r|xz"
+    elif path.name.endswith(".tar.gz"):
+        archive_mode = "r|gz"
+    else:
+        raise RuntimeError(f"unsupported archive extension: {path}")
+    with tarfile.open(path, archive_mode) as archive:
         for member in archive:
             source = archive.extractfile(member)
             if source is None:
@@ -248,7 +293,7 @@ def verify_archive(path: Path, *, full: bool) -> dict[str, Any]:
                         next_progress += PROGRESS_BYTES
     if manifest is None:
         raise RuntimeError(f"manifest missing from {path}")
-    if int(manifest.get("archive_version", 0)) != ARCHIVE_VERSION:
+    if int(manifest.get("archive_version", 0)) not in SUPPORTED_ARCHIVE_VERSIONS:
         raise RuntimeError(f"unsupported archive version in {path}")
     if full:
         if copy_bytes != int(manifest["copy_bytes"]):
@@ -287,24 +332,25 @@ def archive_day(
     zone: ZoneInfo,
     archive_dir: Path,
     columns: list[dict[str, Any]],
-    compression_level: int,
 ) -> None:
     start, end = local_day_bounds(day, zone)
     stats = day_stats(start, end)
     row_count = int(stats["row_count"] or 0)
-    final_path = archive_dir / f"request_logs_{day.isoformat()}.tar.gz"
+    final_path = archive_dir / f"request_logs_{day.isoformat()}.tar.xz"
+    legacy_path = archive_dir / f"request_logs_{day.isoformat()}.tar.gz"
     log(
         f"day={day.isoformat()} rows={row_count} "
         f"payload={int(stats['payload_bytes'] or 0) / 1024 / 1024 / 1024:.2f} GiB"
     )
 
-    if final_path.exists():
-        manifest = verify_archive(final_path, full=row_count > 0)
+    existing_path = final_path if final_path.exists() else legacy_path if legacy_path.exists() else None
+    if existing_path is not None:
+        manifest = verify_archive(existing_path, full=row_count > 0)
         if str(manifest.get("local_day")) != day.isoformat():
-            raise RuntimeError(f"archive day mismatch in {final_path}")
+            raise RuntimeError(f"archive day mismatch in {existing_path}")
         archived_count = int(manifest["row_count"])
         if row_count == 0:
-            log(f"archive already complete: {final_path}")
+            log(f"archive already complete: {existing_path}")
             return
         if row_count != archived_count:
             raise RuntimeError(
@@ -342,10 +388,14 @@ def archive_day(
             "copy_file": copy_name,
             "copy_bytes": copy_bytes,
             "copy_sha256": copy_sha256,
+            "compression": {
+                "format": "xz",
+                "command": list(XZ_COMMAND),
+            },
             "columns": columns,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        build_archive(day, stage_dir, final_path, manifest, compression_level)
+        build_archive(day, stage_dir, final_path, manifest)
         try:
             verify_archive(final_path, full=True)
         except Exception:
@@ -391,16 +441,22 @@ def parse_args() -> argparse.Namespace:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--day", help="archive one local calendar day (YYYY-MM-DD)")
     target.add_argument("--day-offset", type=int, help="archive N local calendar days ago")
-    target.add_argument("--before-today", action="store_true", help="archive every complete day before today")
+    target.add_argument(
+        "--before-retention",
+        action="store_true",
+        help="archive every day older than the retention window",
+    )
     parser.add_argument("--archive-dir", default=DEFAULT_ARCHIVE_DIR)
     parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
-    parser.add_argument("--compression-level", type=int, default=1, choices=range(1, 10))
+    parser.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     parser.add_argument("--vacuum-after", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if shutil.which(XZ_COMMAND[0]) is None:
+        raise RuntimeError("xz executable is required")
     zone = ZoneInfo(args.timezone)
     today = datetime.now(zone).date()
     archive_dir = Path(args.archive_dir).resolve()
@@ -420,15 +476,18 @@ def main() -> int:
                 raise RuntimeError("--day-offset must be at least 1")
             days = [today - timedelta(days=args.day_offset)]
         else:
-            first_day = min_available_day(today, zone)
+            if args.retention_days < 1:
+                raise RuntimeError("--retention-days must be at least 1")
+            retained_start = today - timedelta(days=args.retention_days - 1)
+            first_day = min_available_day(retained_start, zone)
             days = []
-            while first_day is not None and first_day < today:
+            while first_day is not None and first_day < retained_start:
                 days.append(first_day)
                 first_day += timedelta(days=1)
 
         log(f"archive targets: {len(days)} day(s)")
         for day in days:
-            archive_day(day, zone, archive_dir, columns, args.compression_level)
+            archive_day(day, zone, archive_dir, columns)
         if args.vacuum_after:
             run_vacuum()
     return 0
